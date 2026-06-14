@@ -1987,10 +1987,10 @@ function TrustBadges() {
 // ─── Visual Category Grid ─────────────────────────────────────────────────────
 function CategoryGrid({ category, onSelect, vendorCounts }) {
   return (
-    <div style={{ padding:"20px 16px 0" }}>
+    <div style={{ padding:"20px 16px 0", maxWidth:900, margin:"0 auto" }}>
       <div style={{ fontFamily:"'Playfair Display',serif", fontSize:18, fontWeight:700, color:B.text, marginBottom:4 }}>Browse by Category</div>
       <div style={{ fontSize:12, color:B.textMuted, marginBottom:14 }}>What are you looking for?</div>
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:8 }}>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fill, minmax(120px, 1fr))", gap:10 }}>
         {CATEGORIES.filter(c=>c.id!=="all").map(cat=>{
           const active = category===cat.id;
           return (

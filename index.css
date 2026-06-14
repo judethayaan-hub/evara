@@ -19,11 +19,9 @@ body {
 }
 
 #root {
-  max-width: 480px;
-  margin: 0 auto;
   min-height: 100vh;
   min-height: 100dvh;
+  width: 100%;
   background: #F5F4F1;
-  box-shadow: 0 0 60px rgba(0, 0, 0, 0.18);
   position: relative;
 }
