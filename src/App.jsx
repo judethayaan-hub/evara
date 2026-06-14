@@ -1999,7 +1999,7 @@ function CategoryGrid({ category, onSelect, vendorCounts }) {
               onMouseEnter={e=>{ if(!active){ e.currentTarget.style.borderColor=B.primary; e.currentTarget.style.transform="translateY(-2px)"; }}}
               onMouseLeave={e=>{ if(!active){ e.currentTarget.style.borderColor=B.border; e.currentTarget.style.transform=""; }}}>
               <span style={{ fontSize:24 }}>{cat.emoji}</span>
-              <span style={{ fontSize:12, fontWeight:700, color: active ? "#fff" : B.text, textAlign:"center", lineHeight:1.3, wordBreak:"break-word", width:"100%" }}>{cat.label}</span>
+              <span style={{ fontSize:11, fontWeight:700, color: active ? "#fff" : B.text, textAlign:"center", lineHeight:1.3, width:"100%", overflow:"hidden", display:"-webkit-box", WebkitLineClamp:2, WebkitBoxOrient:"vertical" }}>{cat.label}</span>
               {vendorCounts[cat.id]>0 && <span style={{ fontSize:9, color: active ? "rgba(255,255,255,0.6)" : B.textMuted }}>{vendorCounts[cat.id]} available</span>}
             </button>
           );
