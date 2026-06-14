@@ -9,7 +9,7 @@ import { useState, useCallback } from "react";
 import {
   B, StatusBadge, SectionHeader, EmptyState, StatCard,
   Icon, Toast, formatDate, formatMoney, shortId, cardStyle, inputStyle, labelStyle,
-} from "../shared/tokens.jsx";
+} from "../shared/tokens.js";
 
 // ─── Mock data ─────────────────────────────────────────────────────────────────
 const MY_BOOKINGS = [
