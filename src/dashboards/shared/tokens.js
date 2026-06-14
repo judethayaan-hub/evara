@@ -1,5 +1,5 @@
 /**
- * dashboards/shared/tokens.jsx
+ * dashboards/shared/tokens.js
  * ─────────────────────────────────────────────────────────────────────────────
  * Design tokens, shared styles, and micro-components reused across the
  * Admin, Vendor, and Customer dashboards.  Every color, font and spacing
