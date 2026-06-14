@@ -1990,17 +1990,17 @@ function CategoryGrid({ category, onSelect, vendorCounts }) {
     <div style={{ padding:"20px 16px 0" }}>
       <div style={{ fontFamily:"'Playfair Display',serif", fontSize:18, fontWeight:700, color:B.text, marginBottom:4 }}>Browse by Category</div>
       <div style={{ fontSize:12, color:B.textMuted, marginBottom:14 }}>What are you looking for?</div>
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(4, 1fr)", gap:10 }}>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(3, 1fr)", gap:8 }}>
         {CATEGORIES.filter(c=>c.id!=="all").map(cat=>{
           const active = category===cat.id;
           return (
             <button key={cat.id} onClick={()=>onSelect(cat.id)}
-              style={{ background: active ? B.primary : B.surface, border:`2px solid ${active ? B.primary : B.border}`, borderRadius:14, padding:"14px 6px 10px", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:6, transition:"all .15s", boxShadow: active ? `0 4px 16px ${B.primary}33` : "none" }}
+              style={{ background: active ? B.primary : B.surface, border:`2px solid ${active ? B.primary : B.border}`, borderRadius:14, padding:"12px 6px 10px", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:5, transition:"all .15s", boxShadow: active ? `0 4px 16px ${B.primary}33` : "none", minHeight:88 }}
               onMouseEnter={e=>{ if(!active){ e.currentTarget.style.borderColor=B.primary; e.currentTarget.style.transform="translateY(-2px)"; }}}
               onMouseLeave={e=>{ if(!active){ e.currentTarget.style.borderColor=B.border; e.currentTarget.style.transform=""; }}}>
-              <span style={{ fontSize:26 }}>{cat.emoji}</span>
-              <span style={{ fontSize:11, fontWeight:700, color: active ? "#fff" : B.text, textAlign:"center", lineHeight:1.2 }}>{cat.label}</span>
-              {vendorCounts[cat.id]>0 && <span style={{ fontSize:10, color: active ? "rgba(255,255,255,0.6)" : B.textMuted }}>{vendorCounts[cat.id]} available</span>}
+              <span style={{ fontSize:24 }}>{cat.emoji}</span>
+              <span style={{ fontSize:10, fontWeight:700, color: active ? "#fff" : B.text, textAlign:"center", lineHeight:1.25, wordBreak:"break-word", width:"100%" }}>{cat.label}</span>
+              {vendorCounts[cat.id]>0 && <span style={{ fontSize:9, color: active ? "rgba(255,255,255,0.6)" : B.textMuted }}>{vendorCounts[cat.id]} available</span>}
             </button>
           );
         })}
