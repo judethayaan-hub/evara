@@ -97,9 +97,9 @@ const CATEGORIES = [
   { id: "chefs", label: "Chefs", emoji: "👨‍🍳" },
   { id: "catering", label: "Catering", emoji: "🍽️" },
   { id: "djs", label: "DJ & Music", emoji: "🎧" },
-  { id: "photographers", label: "Photography", emoji: "📷" },
+  { id: "photographers", label: "Photo & Video", emoji: "📷" },
   { id: "sports", label: "Indoor Sports", emoji: "🏸" },
-  { id: "florists", label: "Florists & Decoration", emoji: "💐" },
+  { id: "florists", label: "Florists & Decor", emoji: "💐" },
   { id: "makeup", label: "Makeup Artists", emoji: "💄" },
   { id: "videography", label: "Videography", emoji: "🎬" },
   { id: "cakes", label: "Cake & Bakery", emoji: "🎂" },
@@ -107,7 +107,7 @@ const CATEGORIES = [
   { id: "transport", label: "Transport & Limo", emoji: "🚗" },
   { id: "outdoor_venues", label: "Outdoor Venues", emoji: "🌿" },
   { id: "lighting_av", label: "Lighting & AV", emoji: "💡" },
-  { id: "kids_entertainment", label: "Kids Entertainment", emoji: "🎪" },
+  { id: "kids_entertainment", label: "Kids Events", emoji: "🎪" },
 ];
 const VENDOR_CATEGORIES = [
   { id: "wedding", label: "Wedding Hall", emoji: "💒" },
@@ -772,7 +772,7 @@ Respond ONLY with a JSON object, no markdown, no explanation:
           <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:6 }}>
             {mockPhotos.map(p=>(
               <div key={p.id} onClick={()=>toggle(p.id)} style={{ position:"relative", aspectRatio:"1", borderRadius:10, overflow:"hidden", cursor:"pointer", border:`2px solid ${selected.includes(p.id) ? B.accent : "transparent"}` }}>
-                <div style={{ width:"100%", height:"100%", background:`linear-gradient(135deg, #${((p.id*37)%255).toString(16).padStart(2,"0")}4${((p.id*73)%255).toString(16).padStart(2,"0")}8f, #1C2B4B)`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:24 }}>
+                <div style={{ width:"100%", height:"100%", background:`linear-gradient(135deg, #${((p.id*37)%255).toString(16).padStart(2,"0")}4${((p.id*73)%255).toString(16).padStart(2,"0")}8f, #1C2B4B)`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:26 }}>
                   {["📷","🌅","👨‍👩‍👧","🌸","🎊","🕯️","💃","🏛️","🌟","🥂","💒","🎆"][p.id-1]}
                 </div>
                 {selected.includes(p.id) && (
@@ -1990,12 +1990,12 @@ function CategoryGrid({ category, onSelect, vendorCounts }) {
     <div style={{ padding:"20px 16px 0" }}>
       <div style={{ fontFamily:"'Playfair Display',serif", fontSize:18, fontWeight:700, color:B.text, marginBottom:4 }}>Browse by Category</div>
       <div style={{ fontSize:12, color:B.textMuted, marginBottom:14 }}>What are you looking for?</div>
-      <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:10 }}>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(2, 1fr)", gap:8 }}>
         {CATEGORIES.filter(c=>c.id!=="all").map(cat=>{
           const active = category===cat.id;
           return (
             <button key={cat.id} onClick={()=>onSelect(cat.id)}
-              style={{ background: active ? B.primary : B.surface, border:`2px solid ${active ? B.primary : B.border}`, borderRadius:14, padding:"14px 10px 12px", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:5, transition:"all .15s", boxShadow: active ? `0 4px 16px ${B.primary}33` : "none", minHeight:88 }}
+              style={{ background: active ? B.primary : B.surface, border:`2px solid ${active ? B.primary : B.border}`, borderRadius:14, padding:"14px 8px 12px", cursor:"pointer", display:"flex", flexDirection:"column", alignItems:"center", gap:5, transition:"all .15s", boxShadow: active ? `0 4px 16px ${B.primary}33` : "none", minHeight:88 }}
               onMouseEnter={e=>{ if(!active){ e.currentTarget.style.borderColor=B.primary; e.currentTarget.style.transform="translateY(-2px)"; }}}
               onMouseLeave={e=>{ if(!active){ e.currentTarget.style.borderColor=B.border; e.currentTarget.style.transform=""; }}}>
               <span style={{ fontSize:24 }}>{cat.emoji}</span>
