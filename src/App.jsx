@@ -296,8 +296,9 @@ const getGlobalStyle = (mode) => {
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html { height: 100%; -webkit-text-size-adjust: 100%; }
   html, body { width: 100%; max-width: 100vw; overflow-x: hidden; }
-  body { font-family: 'DM Sans', sans-serif; background: ${bodyBg}; color: ${p.text}; min-height: 100vh; min-height: 100dvh; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; overscroll-behavior-y: none; transition: background-color .2s ease; }
+  body { font-family: 'DM Sans', sans-serif; background: ${bodyBg}; color: ${p.text}; min-height: 100vh; min-height: 100dvh; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; transition: background-color .2s ease; }
   #root { min-height: 100vh; min-height: 100dvh; background: ${p.bg}; }
+  @media (max-width: 768px) { body { overscroll-behavior-y: none; } }
   input, textarea, select, button { font-family: inherit; }
   input[type="date"] { color-scheme: ${mode}; }
   ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: ${p.border}; border-radius: 4px; }
