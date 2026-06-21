@@ -25,6 +25,21 @@ const sb = (() => {
   };
   const signOut = async (token) => { await fetch(`${SUPABASE_URL}/auth/v1/logout`, { method: "POST", headers: auth(token) }); };
   const getUser = async (token) => { const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, { headers: auth(token) }); return r.json(); };
+  // Sends a "reset your password" email containing a recovery link. Supabase
+  // redirects back to redirectTo with #access_token=...&type=recovery in the
+  // URL fragment, which App() picks up to show the "set new password" screen.
+  const recoverPassword = async (email, redirectTo) => {
+    const qs = redirectTo ? `?redirect_to=${encodeURIComponent(redirectTo)}` : "";
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/recover${qs}`, { method: "POST", headers: h, body: JSON.stringify({ email }) });
+    if (r.status === 204) return {};
+    return r.json().catch(() => ({}));
+  };
+  // Sets a new password using the short-lived recovery access_token from the
+  // email link (not the user's normal session token).
+  const updatePassword = async (recoveryToken, password) => {
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/user`, { method: "PUT", headers: auth(recoveryToken), body: JSON.stringify({ password }) });
+    return r.json();
+  };
   const query = async (table, params = "", token = null, method = "GET", body = null) => {
     const r = await fetch(`${SUPABASE_URL}/rest/v1/${table}${params}`, { method, headers: { ...auth(token), "Content-Type": "application/json", Prefer: "return=representation" }, body: body ? JSON.stringify(body) : undefined });
     if (r.status === 204) return { data: [], error: null };
@@ -34,7 +49,14 @@ const sb = (() => {
     if (!r.ok) return { data: null, error: { message: data?.message || `HTTP ${r.status}` } };
     return { data, error: null };
   };
-  return { signUp, signIn, signOut, getUser, query, refreshToken };
+  // Calls a Postgres function (RPC), e.g. get_vendor_blocked_dates.
+  const rpc = async (fnName, args = {}, token = null) => {
+    const r = await fetch(`${SUPABASE_URL}/rest/v1/rpc/${fnName}`, { method: "POST", headers: { ...auth(token), "Content-Type": "application/json" }, body: JSON.stringify(args) });
+    const data = await r.json().catch(() => null);
+    if (!r.ok) return { data: null, error: { message: data?.message || `HTTP ${r.status}` } };
+    return { data, error: null };
+  };
+  return { signUp, signIn, signOut, getUser, query, rpc, refreshToken, recoverPassword, updatePassword };
 })();
 
 // ─── PayHere Integration ──────────────────────────────────────────────────────
@@ -95,12 +117,62 @@ function initiatePayHerePayment({ booking, vendor, user, onSuccess, onError }) {
 }
 
 // ─── Design Tokens ────────────────────────────────────────────────────────────
-const B = {
+// Two palettes; `B` itself is a single mutable object whose keys get
+// reassigned when the theme toggles, so every existing `B.xxx` reference
+// throughout the file (inline styles, no CSS classes) picks up the new
+// colors automatically on the next render — no need to thread theme as a
+// prop through 60+ components.
+const LIGHT_PALETTE = {
   primary: "#1C2B4B", accent: "#D4AF6A", accentSoft: "#FBF5E9",
   success: "#1A9B6C", danger: "#D94040", warning: "#D97706",
   bg: "#F5F4F1", surface: "#FFFFFF", border: "#E4E1D9",
   text: "#1C2B4B", textMuted: "#7A7D8C", textLight: "#B0B3C1", dark: "#0C1628",
 };
+const DARK_PALETTE = {
+  primary: "#5B7FD4", accent: "#D4AF6A", accentSoft: "#26314B",
+  success: "#2BC796", danger: "#F0605F", warning: "#F0A93F",
+  bg: "#0B1322", surface: "#141E33", border: "#26314B",
+  text: "#EDEFF5", textMuted: "#9099B5", textLight: "#5A6481", dark: "#0C1628",
+};
+
+const THEME_STORAGE_KEY = "evara_theme";
+const getStoredTheme = () => {
+  try { return localStorage.getItem(THEME_STORAGE_KEY) === "dark" ? "dark" : "light"; } catch { return "light"; }
+};
+
+// Read the stored preference synchronously at module load (before first
+// render) so the very first paint already uses the right palette instead of
+// flashing light-then-dark for returning users.
+let currentThemeMode = getStoredTheme();
+const B = { ...(currentThemeMode === "dark" ? DARK_PALETTE : LIGHT_PALETTE) };
+const themeListeners = new Set();
+
+function applyTheme(mode) {
+  currentThemeMode = mode;
+  const palette = mode === "dark" ? DARK_PALETTE : LIGHT_PALETTE;
+  Object.assign(B, palette);
+  try { localStorage.setItem(THEME_STORAGE_KEY, mode); } catch {}
+  if (typeof document !== "undefined") {
+    document.documentElement.setAttribute("data-theme", mode);
+    document.documentElement.style.colorScheme = mode;
+    const metaTheme = document.querySelector('meta[name="theme-color"]');
+    if (metaTheme) metaTheme.setAttribute("content", mode === "dark" ? DARK_PALETTE.dark : LIGHT_PALETTE.bg);
+  }
+  themeListeners.forEach(fn => fn(mode));
+}
+
+// Hook: re-renders the calling component whenever the theme changes, and
+// returns [mode, toggle]. Call once near the top of the app.
+function useTheme() {
+  const [mode, setMode] = useState(currentThemeMode);
+  useEffect(() => {
+    const listener = (m) => setMode(m);
+    themeListeners.add(listener);
+    return () => themeListeners.delete(listener);
+  }, []);
+  const toggle = useCallback(() => applyTheme(currentThemeMode === "dark" ? "light" : "dark"), []);
+  return [mode, toggle];
+}
 
 const STATUS_STYLE = {
   pending:           { bg: "#FFFBEB", c: "#D97706", label: "Pending" },
@@ -215,7 +287,11 @@ function IcoUnlock()     { return <svg width="14" height="14" viewBox="0 0 24 24
 function IcoCreditCard() { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="1" y="4" width="22" height="16" rx="2"/><line x1="1" y1="10" x2="23" y2="10"/></svg>; }
 function IcoTrendUp()    { return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></svg>; }
 function IcoRefreshCw()  { return <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>; }
-const Icon = { X: IcoX, Search: IcoSearch, Star: IcoStar, MapPin: IcoMapPin, Calendar: IcoCalendar, Users: IcoUsers, ChevronLeft: IcoChevronLeft, ChevronRight: IcoChevronRight, Print: IcoPrint, LogOut: IcoLogOut, Home: IcoHome, Bookmark: IcoBookmark, User: IcoUser, Shield: IcoShield, Check: IcoCheck, Unlock: IcoUnlock, CreditCard: IcoCreditCard, TrendUp: IcoTrendUp, RefreshCw: IcoRefreshCw };
+function IcoSun()         { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="4.5"/><path d="M12 2.5v3M12 18.5v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2.5 12h3M18.5 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"/></svg>; }
+function IcoMoon()        { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>; }
+function IcoLayoutDash()  { return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>; }
+function IcoBell()        { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8a6 6 0 1 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>; }
+const Icon = { X: IcoX, Search: IcoSearch, Star: IcoStar, MapPin: IcoMapPin, Calendar: IcoCalendar, Users: IcoUsers, ChevronLeft: IcoChevronLeft, ChevronRight: IcoChevronRight, Print: IcoPrint, LogOut: IcoLogOut, Home: IcoHome, Bookmark: IcoBookmark, User: IcoUser, Shield: IcoShield, Check: IcoCheck, Unlock: IcoUnlock, CreditCard: IcoCreditCard, TrendUp: IcoTrendUp, RefreshCw: IcoRefreshCw, Sun: IcoSun, Moon: IcoMoon, LayoutDash: IcoLayoutDash, Bell: IcoBell };
 
 // ─── EvaraLogo ────────────────────────────────────────────────────────────────
 function EvaraLogo({ size = "md", dark = false, onClick }) {
@@ -235,36 +311,43 @@ function EvaraLogo({ size = "md", dark = false, onClick }) {
 }
 
 // ─── Global Styles ────────────────────────────────────────────────────────────
-const GLOBAL_STYLE = `
+const getGlobalStyle = (mode) => {
+  const p = mode === "dark" ? DARK_PALETTE : LIGHT_PALETTE;
+  const bodyBg = mode === "dark" ? "#070D18" : "#E8E6E0";
+  return `
   @import url('https://fonts.googleapis.com/css2?family=Playfair+Display:wght@500;700&family=DM+Sans:wght@400;500;600;700&display=swap');
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   html { height: 100%; -webkit-text-size-adjust: 100%; }
-  body { font-family: 'DM Sans', sans-serif; background: #E8E6E0; color: #1C2B4B; height: 100%; overflow-x: hidden; max-width: 100vw; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; overscroll-behavior: none; }
-  #root { min-height: 100vh; background: #F5F4F1; }
+  html, body { width: 100%; max-width: 100vw; overflow-x: hidden; }
+  body { font-family: 'DM Sans', sans-serif; background: ${bodyBg}; color: ${p.text}; min-height: 100vh; min-height: 100dvh; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; overscroll-behavior-y: none; transition: background-color .2s ease; }
+  #root { min-height: 100vh; min-height: 100dvh; background: ${p.bg}; }
   input, textarea, select, button { font-family: inherit; }
-  input[type="date"] { color-scheme: light; }
-  ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: #E4E1D9; border-radius: 4px; }
+  input[type="date"] { color-scheme: ${mode}; }
+  ::-webkit-scrollbar { width: 5px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: ${p.border}; border-radius: 4px; }
   @keyframes slideUp { from { transform: translateY(60px); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
   @keyframes fadeIn  { from { opacity: 0; } to { opacity: 1; } }
   @keyframes pulse   { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
   @keyframes spin    { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   @supports (padding-bottom: env(safe-area-inset-bottom)) { .safe-bottom { padding-bottom: env(safe-area-inset-bottom); } }
 
-  .evara-shell { display: flex; min-height: 100vh; overflow: hidden; }
+  .evara-shell { display: flex; min-height: 100vh; min-height: 100dvh; overflow-x: hidden; width: 100%; max-width: 100vw; }
   .evara-sidebar { width: 256px; flex-shrink: 0; background: #0C1628; display: flex; flex-direction: column; position: fixed; top: 0; left: 0; bottom: 0; z-index: 300; border-right: 1px solid rgba(255,255,255,0.05); }
   .evara-sidebar-logo { padding: 28px 24px 22px; border-bottom: 1px solid rgba(255,255,255,0.05); }
-  .evara-sidebar-nav { padding: 16px 14px; display: flex; flex-direction: column; gap: 2px; flex: 1; }
+  .evara-sidebar-nav { padding: 16px 14px; display: flex; flex-direction: column; gap: 2px; flex: 1; overflow-y: auto; }
   .evara-sidebar-item { display: flex; align-items: center; gap: 12px; padding: 11px 14px; border-radius: 8px; cursor: pointer; border: none; background: none; color: rgba(255,255,255,0.45); font-size: 13.5px; font-weight: 500; font-family: 'DM Sans', sans-serif; width: 100%; text-align: left; transition: background .15s, color .15s; letter-spacing: 0.1px; }
   .evara-sidebar-item:hover { background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.8); }
   .evara-sidebar-item.active { background: rgba(212,175,106,0.1); color: #D4AF6A; font-weight: 600; border-left: 2px solid #D4AF6A; padding-left: 12px; }
   .evara-sidebar-footer { padding: 14px; border-top: 1px solid rgba(255,255,255,0.05); }
   .evara-sidebar-avatar { width: 36px; height: 36px; border-radius: 50%; background: linear-gradient(135deg, #D4AF6A, #B8923E); display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; color: #0C1628; flex-shrink: 0; }
 
-  .evara-main { flex: 1; min-width: 0; overflow-x: hidden; }
+  .evara-main { flex: 1; min-width: 0; overflow-x: hidden; width: 100%; max-width: 100vw; }
+
+  /* ── Mobile (default / base) ── */
+  .evara-page-header, .evara-page-inner, .evara-page-header-inner { width: 100%; max-width: 100vw; box-sizing: border-box; }
 
   /* ── Laptop / desktop ── */
   @media (min-width: 769px) {
-    .evara-main { margin-left: 256px; overflow-x: hidden; }
+    .evara-main { margin-left: 256px; overflow-x: hidden; max-width: calc(100vw - 256px); }
     .evara-bottom-nav { display: none !important; }
     .evara-page-header { padding-top: 36px !important; width: 100%; box-sizing: border-box; }
     .evara-page-inner { width: 100%; padding: 0 32px; box-sizing: border-box; }
@@ -281,6 +364,7 @@ const GLOBAL_STYLE = `
     .vendor-card-img { width: 100px !important; height: 100px !important; }
     .vendor-card { padding: 20px !important; }
     .stats-scroll { display: grid !important; grid-template-columns: repeat(3, 1fr) !important; min-width: unset !important; }
+    .dash-stats-grid { grid-template-columns: repeat(4, 1fr) !important; }
   }
   /* ── Wide desktop ── */
   @media (min-width: 1200px) {
@@ -288,12 +372,16 @@ const GLOBAL_STYLE = `
     .cat-grid { grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)) !important; }
     .stats-scroll { grid-template-columns: repeat(6, 1fr) !important; }
   }
-  @media (min-width: 1200px) { .vendor-grid { grid-template-columns: repeat(3, 1fr) !important; } }
   @media (max-width: 768px) {
     .evara-sidebar { display: none !important; }
-    .evara-main { margin-left: 0; }
+    .evara-main { margin-left: 0; max-width: 100vw; }
     .evara-bottom-nav { display: flex !important; }
     .mobile-signin-btn { display: block; }
+    .hero-title { font-size: 26px !important; }
+    img { max-width: 100%; }
+  }
+  @media (max-width: 380px) {
+    .evara-page-header-inner, .evara-page-inner { padding-left: 12px !important; padding-right: 12px !important; }
   }
 
   @media (min-width: 769px) { .mobile-signin-btn { display: none !important; } }
@@ -313,6 +401,7 @@ const GLOBAL_STYLE = `
   }
 
 `;
+};
 
 // ─── Toast ────────────────────────────────────────────────────────────────────
 function Toast({ toast }) {
@@ -323,7 +412,56 @@ function Toast({ toast }) {
 }
 
 function Skeleton({ w = "100%", h = 16, r = 8 }) {
-  return <div style={{ width: w, height: h, borderRadius: r, background: "linear-gradient(90deg,#E8E5DC 25%,#F0EDE4 50%,#E8E5DC 75%)", backgroundSize: "200% 100%", animation: "pulse 1.5s ease-in-out infinite" }}/>;
+  return <div style={{ width: w, height: h, borderRadius: r, background: `linear-gradient(90deg,${B.border} 25%,${B.surface} 50%,${B.border} 75%)`, backgroundSize: "200% 100%", animation: "pulse 1.5s ease-in-out infinite" }}/>;
+}
+
+// ─── Theme Toggle ─────────────────────────────────────────────────────────────
+// `variant` controls where it's rendered: "sidebar" (desktop dark sidebar pill),
+// "header" (small icon button on dark navy headers), or "row" (a settings-style
+// row used inside Profile).
+function ThemeToggle({ variant = "header" }) {
+  const [mode, toggle] = useTheme();
+  const isDark = mode === "dark";
+
+  if (variant === "row") {
+    return (
+      <button onClick={toggle} style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", background: "none", border: "none", cursor: "pointer", textAlign: "left" }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <span style={{ width: 30, height: 30, borderRadius: 8, background: B.bg, border: `1px solid ${B.border}`, display: "flex", alignItems: "center", justifyContent: "center", color: B.text }}>
+            {isDark ? <Icon.Moon/> : <Icon.Sun/>}
+          </span>
+          <span style={{ fontSize: 13, fontWeight: 600, color: B.text }}>Appearance</span>
+        </span>
+        <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 12, color: B.textMuted, fontWeight: 600 }}>{isDark ? "Dark" : "Light"}</span>
+          <span style={{ width: 38, height: 22, borderRadius: 11, background: isDark ? B.primary : B.border, position: "relative", transition: "background .15s", flexShrink: 0 }}>
+            <span style={{ position: "absolute", top: 2, left: isDark ? 18 : 2, width: 18, height: 18, borderRadius: "50%", background: "#fff", transition: "left .15s", boxShadow: "0 1px 3px rgba(0,0,0,0.25)" }}/>
+          </span>
+        </span>
+      </button>
+    );
+  }
+
+  if (variant === "sidebar") {
+    return (
+      <button onClick={toggle} className="evara-sidebar-item" style={{ justifyContent: "space-between" }} title={isDark ? "Switch to light mode" : "Switch to dark mode"}>
+        <span style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          {isDark ? <Icon.Moon/> : <Icon.Sun/>}
+          <span>{isDark ? "Dark Mode" : "Light Mode"}</span>
+        </span>
+        <span style={{ width: 32, height: 18, borderRadius: 9, background: isDark ? "rgba(212,175,106,0.35)" : "rgba(255,255,255,0.12)", position: "relative", flexShrink: 0 }}>
+          <span style={{ position: "absolute", top: 2, left: isDark ? 16 : 2, width: 14, height: 14, borderRadius: "50%", background: isDark ? "#D4AF6A" : "rgba(255,255,255,0.6)", transition: "left .15s" }}/>
+        </span>
+      </button>
+    );
+  }
+
+  // "header" — compact icon-only button for dark navy page headers (mobile + desktop)
+  return (
+    <button onClick={toggle} aria-label="Toggle theme" title={isDark ? "Switch to light mode" : "Switch to dark mode"} style={{ width: 36, height: 36, borderRadius: "50%", background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.14)", color: "rgba(255,255,255,0.85)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}>
+      {isDark ? <Icon.Moon/> : <Icon.Sun/>}
+    </button>
+  );
 }
 
 // ─── PayHere Payment Button ───────────────────────────────────────────────────
@@ -345,7 +483,20 @@ function PayHereButton({ booking, vendor, user, token, onPaymentSuccess, showToa
           payhere_order_id: orderId,
         });
         setProcessing(false);
-        if (error) { showToast("Payment recorded but status update failed. Contact support.", "error"); return; }
+        if (error) {
+          // The database's double-booking safeguard rejects this if someone
+          // else's booking already locked this vendor+date in between this
+          // person opening the form and finishing payment — rare, but real
+          // money has already moved, so this needs to be unambiguous about
+          // what happened and that a refund is coming, not a vague error.
+          const isDoubleBooked = error.message?.includes("duplicate") || error.message?.includes("bookings_vendor_date_locked");
+          if (isDoubleBooked) {
+            showToast("That date was just booked by someone else. Your payment will be refunded — contact support if it isn't reversed within a few days.", "error");
+          } else {
+            showToast("Payment recorded but status update failed. Contact support with your order ID: " + orderId, "error");
+          }
+          return;
+        }
         showToast("Payment successful! 🎉 Your payment is protected.", "success");
         onPaymentSuccess && onPaymentSuccess();
       },
@@ -455,6 +606,310 @@ function Receipt({ booking, onClose }) {
   );
 }
 
+// ─── Reviews ───────────────────────────────────────────────────────────────────
+// Reviews are written by a customer once their booking reaches "completed",
+// one review per booking (enforced by a unique index on booking_id in
+// Supabase — see the SQL note further down). Vendor rating shown anywhere in
+// the app is the live average of these rows, not a number typed into the
+// admin form.
+async function fetchVendorReviews(vendorId, token = null) {
+  const { data } = await sb.query("reviews", `?vendor_id=eq.${vendorId}&select=*&order=created_at.desc`, token);
+  const reviews = data || [];
+  const count = reviews.length;
+  const avg = count ? reviews.reduce((s, r) => s + (r.rating || 0), 0) / count : null;
+  return { reviews, count, avg };
+}
+
+function StarRow({ rating, size = 13, gap = 2 }) {
+  const full = Math.round(rating || 0);
+  return (
+    <span style={{ display: "inline-flex", gap }}>
+      {[1, 2, 3, 4, 5].map(n => <Icon.Star key={n} filled={n <= full}/>)}
+    </span>
+  );
+}
+
+// Compact rating badge used on vendor cards / detail header. Shows the live
+// average once there's at least one review; otherwise a neutral "New" badge
+// instead of a made-up number, so we never show a rating nobody actually gave.
+function RatingBadge({ avg, count, size = "sm" }) {
+  if (!count) {
+    return <span style={{ display: "inline-flex", alignItems: "center", gap: 4, background: B.bg, borderRadius: 8, padding: "2px 7px", border: `1px solid ${B.border}` }}><span style={{ fontSize: 11, fontWeight: 600, color: B.textMuted }}>New</span></span>;
+  }
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: 3, background: B.accentSoft, borderRadius: 8, padding: "2px 7px" }}>
+      <Icon.Star filled/>
+      <span style={{ fontSize: 12, fontWeight: 700, color: B.accent }}>{avg.toFixed(1)}</span>
+      {size !== "sm" && <span style={{ fontSize: 11, color: B.textMuted, fontWeight: 500 }}>({count})</span>}
+    </span>
+  );
+}
+
+// ─── Saved Vendors (favorites) ─────────────────────────────────────────────────
+// Lifted to App level so the same saved-set stays in sync whether the heart
+// is toggled from a card in the Explore grid or from the vendor detail page.
+function useFavorites(user, token) {
+  const [favoriteIds, setFavoriteIds] = useState(new Set());
+  const [loaded, setLoaded] = useState(false);
+
+  const fetchFavorites = useCallback(async () => {
+    if (!user) { setFavoriteIds(new Set()); setLoaded(true); return; }
+    const { data } = await sb.query("favorites", `?user_id=eq.${user.id}&select=vendor_id`, token);
+    setFavoriteIds(new Set((data || []).map(f => f.vendor_id)));
+    setLoaded(true);
+  }, [user, token]);
+
+  useEffect(() => { fetchFavorites(); }, [fetchFavorites]);
+
+  const toggleFavorite = useCallback(async (vendorId) => {
+    if (!user) return false; // caller should prompt sign-in instead of calling this
+    const isFav = favoriteIds.has(vendorId);
+    // Optimistic update — flip it instantly, roll back only if the request
+    // actually fails, so the heart never feels laggy.
+    setFavoriteIds(prev => {
+      const next = new Set(prev);
+      isFav ? next.delete(vendorId) : next.add(vendorId);
+      return next;
+    });
+    const { error } = isFav
+      ? await sb.query("favorites", `?user_id=eq.${user.id}&vendor_id=eq.${vendorId}`, token, "DELETE")
+      : await sb.query("favorites", "", token, "POST", { user_id: user.id, vendor_id: vendorId });
+    if (error) {
+      setFavoriteIds(prev => {
+        const next = new Set(prev);
+        isFav ? next.add(vendorId) : next.delete(vendorId);
+        return next;
+      });
+      return false;
+    }
+    return true;
+  }, [user, token, favoriteIds]);
+
+  return { favoriteIds, loaded, toggleFavorite, refetchFavorites: fetchFavorites };
+}
+
+// Small heart toggle, reused on vendor cards and the vendor detail hero.
+// variant="card" sits as a round button over light/photo backgrounds;
+// variant="hero" sits over the dark navy vendor-detail header.
+function FavoriteButton({ vendorId, isFavorited, onToggle, onNeedAuth, variant = "card" }) {
+  const [busy, setBusy] = useState(false);
+  const handleClick = async (e) => {
+    e.stopPropagation();
+    if (busy) return;
+    if (!onToggle) { onNeedAuth && onNeedAuth(); return; }
+    setBusy(true);
+    await onToggle(vendorId);
+    setBusy(false);
+  };
+  const baseStyle = variant === "hero"
+    ? { background: "rgba(255,255,255,0.15)", color: isFavorited ? "#FF6B81" : "#fff", backdropFilter: "blur(8px)" }
+    : { background: B.surface, color: isFavorited ? "#FF6B81" : B.textMuted, border: `1px solid ${B.border}`, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" };
+  return (
+    <button onClick={handleClick} aria-label={isFavorited ? "Remove from saved" : "Save vendor"} style={{ width: 34, height: 34, borderRadius: "50%", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: busy ? "default" : "pointer", flexShrink: 0, ...baseStyle }}>
+      <svg width="17" height="17" viewBox="0 0 24 24" fill={isFavorited ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+    </button>
+  );
+}
+
+// ─── Notifications ──────────────────────────────────────────────────────────
+// Backed by the `notifications` table, populated automatically by a Postgres
+// trigger on bookings (see notifications-setup.sql) — the app never writes
+// notification rows itself, it only reads and marks them read. Polls every
+// 30s rather than using a realtime subscription, which keeps this in line
+// with the rest of the app's plain-fetch data pattern.
+function useNotifications(user, token) {
+  const [notifications, setNotifications] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+
+  const fetchNotifications = useCallback(async () => {
+    if (!user) { setNotifications([]); setLoaded(true); return; }
+    const { data } = await sb.query("notifications", `?user_id=eq.${user.id}&select=*&order=created_at.desc&limit=30`, token);
+    setNotifications(data || []);
+    setLoaded(true);
+  }, [user, token]);
+
+  useEffect(() => {
+    fetchNotifications();
+    if (!user) return;
+    const interval = setInterval(fetchNotifications, 30000);
+    return () => clearInterval(interval);
+  }, [fetchNotifications, user]);
+
+  const unreadCount = notifications.filter(n => !n.read).length;
+
+  const markRead = useCallback(async (id) => {
+    setNotifications(prev => prev.map(n => n.id === id ? { ...n, read: true } : n));
+    await sb.query("notifications", `?id=eq.${id}`, token, "PATCH", { read: true });
+  }, [token]);
+
+  const markAllRead = useCallback(async () => {
+    const unreadIds = notifications.filter(n => !n.read).map(n => n.id);
+    if (!unreadIds.length) return;
+    setNotifications(prev => prev.map(n => ({ ...n, read: true })));
+    await sb.query("notifications", `?user_id=eq.${user.id}&read=eq.false`, token, "PATCH", { read: true });
+  }, [user, token, notifications]);
+
+  return { notifications, unreadCount, loaded, markRead, markAllRead, refetchNotifications: fetchNotifications };
+}
+
+function timeAgo(dateStr) {
+  const diff = (Date.now() - new Date(dateStr).getTime()) / 1000;
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
+  return formatDate(dateStr);
+}
+
+const NOTIF_ICONS = {
+  new_booking_request: "📩", booking_confirmed: "✅", payment_received: "💳",
+  release_requested: "🔓", payment_released: "💰", completed: "⭐", cancelled: "✕",
+  vendor_approved: "🎉", vendor_rejected: "📋", vendor_resubmitted: "🔄",
+};
+
+// variant="header" (light icon button, used on dark navy headers) or
+// variant="sidebar" (used inside the desktop sidebar nav list).
+function NotificationBell({ user, token, variant = "header", onNavigateToBooking }) {
+  const { notifications, unreadCount, markRead, markAllRead } = useNotifications(user, token);
+  const [open, setOpen] = useState(false);
+  const panelRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClickOutside = (e) => { if (panelRef.current && !panelRef.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", onClickOutside);
+    return () => document.removeEventListener("mousedown", onClickOutside);
+  }, [open]);
+
+  if (!user) return null;
+
+  const panel = (
+    <div ref={panelRef} style={{ position: "absolute", top: "calc(100% + 8px)", right: 0, width: 340, maxWidth: "calc(100vw - 32px)", maxHeight: 420, background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, boxShadow: "0 16px 48px rgba(0,0,0,0.22)", overflow: "hidden", display: "flex", flexDirection: "column", zIndex: 500 }}>
+      <div style={{ padding: "12px 16px", borderBottom: `1px solid ${B.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+        <span style={{ fontWeight: 700, fontSize: 14, color: B.text }}>Notifications</span>
+        {unreadCount > 0 && <button onClick={markAllRead} style={{ background: "none", border: "none", color: B.accent, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>Mark all read</button>}
+      </div>
+      <div style={{ overflowY: "auto", flex: 1 }}>
+        {notifications.length === 0 ? (
+          <div style={{ padding: "40px 20px", textAlign: "center", color: B.textMuted }}>
+            <div style={{ fontSize: 28, marginBottom: 8, opacity: 0.5 }}>🔔</div>
+            <div style={{ fontSize: 13 }}>You're all caught up</div>
+          </div>
+        ) : (
+          notifications.map(n => (
+            <button key={n.id} onClick={() => { if (!n.read) markRead(n.id); if (n.booking_id && onNavigateToBooking) { onNavigateToBooking(); setOpen(false); } }} style={{ width: "100%", textAlign: "left", display: "flex", gap: 10, padding: "12px 16px", background: n.read ? "transparent" : B.accentSoft, border: "none", borderBottom: `1px solid ${B.border}`, cursor: "pointer" }}>
+              <span style={{ fontSize: 18, flexShrink: 0, lineHeight: 1 }}>{NOTIF_ICONS[n.type] || "🔔"}</span>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 }}>
+                  <span style={{ fontSize: 13, fontWeight: n.read ? 600 : 700, color: B.text }}>{n.title}</span>
+                  {!n.read && <span style={{ width: 7, height: 7, borderRadius: "50%", background: B.accent, flexShrink: 0 }}/>}
+                </span>
+                {n.body && <span style={{ display: "block", fontSize: 12, color: B.textMuted, marginTop: 2, lineHeight: 1.4 }}>{n.body}</span>}
+                <span style={{ display: "block", fontSize: 11, color: B.textLight, marginTop: 4 }}>{timeAgo(n.created_at)}</span>
+              </span>
+            </button>
+          ))
+        )}
+      </div>
+    </div>
+  );
+
+  if (variant === "sidebar") {
+    return (
+      <div style={{ position: "relative" }}>
+        <button onClick={() => setOpen(o => !o)} className="evara-sidebar-item" style={{ justifyContent: "space-between" }}>
+          <span style={{ display: "flex", alignItems: "center", gap: 12 }}><Icon.Bell/><span>Notifications</span></span>
+          {unreadCount > 0 && <span style={{ background: B.accent, color: B.dark, fontSize: 10.5, fontWeight: 700, padding: "1px 7px", borderRadius: 10, flexShrink: 0 }}>{unreadCount}</span>}
+        </button>
+        {open && panel}
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ position: "relative" }}>
+      <button onClick={() => setOpen(o => !o)} aria-label="Notifications" style={{ width: 36, height: 36, borderRadius: "50%", background: "rgba(255,255,255,0.08)", border: "1px solid rgba(255,255,255,0.14)", color: "rgba(255,255,255,0.85)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0, position: "relative" }}>
+        <Icon.Bell/>
+        {unreadCount > 0 && <span style={{ position: "absolute", top: -2, right: -2, minWidth: 16, height: 16, padding: "0 3px", borderRadius: 8, background: "#FF6B81", color: "#fff", fontSize: 9.5, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", border: `1.5px solid ${B.dark}` }}>{unreadCount > 9 ? "9+" : unreadCount}</span>}
+      </button>
+      {open && panel}
+    </div>
+  );
+}
+
+
+function ReviewModal({ booking, token, onClose, onSubmitted, showToast }) {
+  const [rating, setRating] = useState(5);
+  const [hoverRating, setHoverRating] = useState(0);
+  const [comment, setComment] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  const submit = async () => {
+    if (!rating) { setError("Please choose a star rating."); return; }
+    setLoading(true); setError("");
+    const body = {
+      booking_id: booking.id,
+      vendor_id: booking.vendor_id,
+      user_id: booking.user_id,
+      rating,
+      comment: comment.trim() || null,
+    };
+    const { error: err } = await sb.query("reviews", "", token, "POST", body);
+    setLoading(false);
+    if (err) {
+      // Most likely cause: a unique constraint on booking_id, meaning this
+      // booking already has a review (e.g. a stale UI state after a refresh).
+      setError(err.message?.includes("duplicate") ? "You've already reviewed this booking." : (err.message || "Couldn't submit your review. Please try again."));
+      return;
+    }
+    showToast && showToast("Thanks for your review! 🌟", "success");
+    onSubmitted && onSubmitted();
+    onClose();
+  };
+
+  return (
+    <>
+      <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 600, background: "rgba(12,22,40,0.65)", backdropFilter: "blur(4px)" }}/>
+      <div style={{ position: "fixed", inset: 0, zIndex: 700, display: "flex", alignItems: "flex-end", justifyContent: "center", pointerEvents: "none" }}>
+        <div style={{ width: "100%", maxWidth: 440, maxHeight: "92vh", background: B.bg, borderRadius: "22px 22px 0 0", overflow: "hidden", display: "flex", flexDirection: "column", pointerEvents: "all", animation: "slideUp .35s cubic-bezier(.22,1,.36,1) both" }}>
+          <div style={{ padding: "16px 20px", background: B.surface, borderBottom: `1px solid ${B.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 16, color: B.text }}>Rate your experience</div>
+              <div style={{ fontSize: 12, color: B.textMuted }}>{booking.vendors?.name || "Vendor"}</div>
+            </div>
+            <button onClick={onClose} style={{ width: 34, height: 34, borderRadius: 8, border: `1.5px solid ${B.border}`, background: B.surface, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: B.textMuted }}><Icon.X/></button>
+          </div>
+          <div style={{ overflowY: "auto", flex: 1, padding: "24px 20px 32px", display: "flex", flexDirection: "column", gap: 18 }}>
+            <div style={{ textAlign: "center" }}>
+              <div style={{ fontSize: 13, color: B.textMuted, marginBottom: 12 }}>How was {booking.vendors?.name || "this vendor"}?</div>
+              <div style={{ display: "flex", justifyContent: "center", gap: 8 }}>
+                {[1, 2, 3, 4, 5].map(n => (
+                  <button key={n} type="button" onClick={() => setRating(n)} onMouseEnter={() => setHoverRating(n)} onMouseLeave={() => setHoverRating(0)} style={{ background: "none", border: "none", cursor: "pointer", padding: 4, color: B.accent, transform: (hoverRating || rating) >= n ? "scale(1.12)" : "scale(1)", transition: "transform .1s" }}>
+                    <svg width="32" height="32" viewBox="0 0 24 24" fill={(hoverRating || rating) >= n ? B.accent : "none"} stroke={B.accent} strokeWidth="1.5"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg>
+                  </button>
+                ))}
+              </div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: B.text, marginTop: 8 }}>
+                {{ 1: "Poor", 2: "Below average", 3: "Okay", 4: "Good", 5: "Excellent" }[hoverRating || rating]}
+              </div>
+            </div>
+            <div>
+              <label style={{ fontSize: 12, fontWeight: 600, color: B.textMuted, display: "block", marginBottom: 6 }}>Tell others about it (optional)</label>
+              <textarea value={comment} onChange={e => setComment(e.target.value)} maxLength={600} rows={4} placeholder="What stood out — good or bad?" style={{ width: "100%", padding: 12, borderRadius: 12, border: `1.5px solid ${B.border}`, background: B.surface, color: B.text, fontSize: 14, fontFamily: "inherit", resize: "vertical", outline: "none" }}/>
+            </div>
+            {error && <div style={{ fontSize: 12, color: B.danger, fontWeight: 600 }}>{error}</div>}
+            <button onClick={submit} disabled={loading} style={{ width: "100%", padding: 14, borderRadius: 12, background: loading ? B.textLight : B.primary, color: "#fff", fontWeight: 700, fontSize: 14, border: "none", cursor: loading ? "not-allowed" : "pointer" }}>
+              {loading ? "Submitting…" : "Submit Review"}
+            </button>
+            <div style={{ fontSize: 11, color: B.textMuted, textAlign: "center" }}>Your review will be public on this vendor's profile.</div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
 // ─── Booking Modal with PayHere ───────────────────────────────────────────────
 function BookingModal({ vendor, user, token, onClose, onSuccess, showToast }) {
   const packages = ["Basic", "Standard", "Premium"];
@@ -464,11 +919,29 @@ function BookingModal({ vendor, user, token, onClose, onSuccess, showToast }) {
   const [booking, setBooking] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [blockedDates, setBlockedDates] = useState(new Set());
+  const [loadingDates, setLoadingDates] = useState(true);
+
+  // Pull this vendor's already-confirmed/paid dates once when the modal
+  // opens, so we can warn before someone fills out the whole form, not
+  // just after they hit submit.
+  useEffect(() => {
+    let active = true;
+    sb.rpc("get_vendor_blocked_dates", { p_vendor_id: vendor.id }).then(({ data }) => {
+      if (!active) return;
+      setBlockedDates(new Set((data || []).map(d => d.event_date)));
+      setLoadingDates(false);
+    });
+    return () => { active = false; };
+  }, [vendor.id]);
+
+  const isDateBlocked = form.event_date && blockedDates.has(form.event_date);
 
   const handlePackageChange = (pkg) => setForm(f => ({ ...f, package: pkg, amount: PRICE_MAP[pkg] || f.amount }));
 
   const handleSubmit = async () => {
     if (!form.event_date || !form.event_type || !form.guests) { setError("Please fill in all required fields."); return; }
+    if (isDateBlocked) { setError("That date is already booked for this vendor — please choose another."); return; }
     setLoading(true); setError("");
     const body = { vendor_id: vendor.id, user_id: user.id, event_date: form.event_date, event_type: form.event_type, guests: parseInt(form.guests) || 0, location: form.location, package: form.package, notes: form.notes, amount: form.amount, status: "pending" };
     const { data, error: err } = await sb.query("bookings", "", token, "POST", body);
@@ -585,7 +1058,23 @@ function BookingModal({ vendor, user, token, onClose, onSuccess, showToast }) {
                     })}
                   </div>
                 </div>
-                {[{ key: "event_date", label: "Event Date *", type: "date" }, { key: "event_type", label: "Event Type *", type: "text", placeholder: "Wedding, Birthday, Corporate..." }, { key: "guests", label: "Number of Guests *", type: "number", placeholder: "e.g. 150" }, { key: "location", label: "Event Location", type: "text", placeholder: vendor?.location || "Venue address" }].map(({ key, label, type, placeholder }) => (
+                <div>
+                  <div style={{ fontSize: 12, fontWeight: 600, color: B.textMuted, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.8 }}>Event Date *</div>
+                  <input type="date" value={form.event_date} min={new Date().toISOString().split("T")[0]} onChange={e => setForm(f => ({ ...f, event_date: e.target.value }))} style={{ width: "100%", padding: "12px 14px", borderRadius: 10, border: `1.5px solid ${isDateBlocked ? B.danger : B.border}`, background: B.surface, fontSize: 14, color: B.text, outline: "none" }}/>
+                  {loadingDates && form.event_date && <div style={{ fontSize: 11.5, color: B.textMuted, marginTop: 6 }}>Checking availability…</div>}
+                  {!loadingDates && isDateBlocked && (
+                    <div style={{ display: "flex", alignItems: "flex-start", gap: 6, marginTop: 6, color: B.danger }}>
+                      <span style={{ flexShrink: 0, marginTop: 1 }}><Icon.X/></span>
+                      <span style={{ fontSize: 12, fontWeight: 600 }}>This date is already booked for {vendor.name}. Please choose another date.</span>
+                    </div>
+                  )}
+                  {!loadingDates && !isDateBlocked && form.event_date && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6, color: B.success }}>
+                      <Icon.Check/><span style={{ fontSize: 12, fontWeight: 600 }}>Available</span>
+                    </div>
+                  )}
+                </div>
+                {[{ key: "event_type", label: "Event Type *", type: "text", placeholder: "Wedding, Birthday, Corporate..." }, { key: "guests", label: "Number of Guests *", type: "number", placeholder: "e.g. 150" }, { key: "location", label: "Event Location", type: "text", placeholder: vendor?.location || "Venue address" }].map(({ key, label, type, placeholder }) => (
                   <div key={key}>
                     <div style={{ fontSize: 12, fontWeight: 600, color: B.textMuted, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.8 }}>{label}</div>
                     <input type={type} value={form[key]} placeholder={placeholder} onChange={e => setForm(f => ({ ...f, [key]: e.target.value }))} style={{ width: "100%", padding: "12px 14px", borderRadius: 10, border: `1.5px solid ${B.border}`, background: B.surface, fontSize: 14, color: B.text, outline: "none" }}/>
@@ -602,7 +1091,7 @@ function BookingModal({ vendor, user, token, onClose, onSuccess, showToast }) {
                     <div style={{ fontFamily: "'Playfair Display',serif", fontSize: 22, fontWeight: 700, color: B.accent }}>{fmt(form.amount)}</div>
                     <div style={{ fontSize: 11, color: "rgba(255,255,255,0.4)", marginTop: 2 }}>incl. 5% platform fee · Secure payment</div>
                   </div>
-                  <button onClick={handleSubmit} disabled={loading} style={{ padding: "12px 24px", borderRadius: 12, background: B.accent, color: B.dark, fontWeight: 700, fontSize: 14, border: "none", cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.7 : 1 }}>
+                  <button onClick={handleSubmit} disabled={loading || isDateBlocked} style={{ padding: "12px 24px", borderRadius: 12, background: (loading || isDateBlocked) ? B.textLight : B.accent, color: B.dark, fontWeight: 700, fontSize: 14, border: "none", cursor: (loading || isDateBlocked) ? "not-allowed" : "pointer", opacity: loading ? 0.7 : 1 }}>
                     {loading ? "Booking…" : "Confirm Booking"}
                   </button>
                 </div>
@@ -616,42 +1105,66 @@ function BookingModal({ vendor, user, token, onClose, onSuccess, showToast }) {
 }
 
 // ─── Vendor Detail ────────────────────────────────────────────────────────────
-function VendorDetail({ vendor, user, token, onBack, onBookingSuccess, showToast, onShowAuth }) {
+function VendorDetail({ vendor, user, token, onBack, onBookingSuccess, showToast, onShowAuth, isFavorited, onToggleFavorite }) {
   const [showBooking, setShowBooking] = useState(false);
   const [activeTab, setActiveTab] = useState("overview");
-  const tabs = [{ id: "overview", label: "Overview" }, { id: "packages", label: "Packages" }];
+  const [reviews, setReviews] = useState([]);
+  const [reviewCount, setReviewCount] = useState(0);
+  const [reviewAvg, setReviewAvg] = useState(null);
+  const [loadingReviews, setLoadingReviews] = useState(true);
+  const tabs = [{ id: "overview", label: "Overview" }, { id: "packages", label: "Packages" }, { id: "reviews", label: `Reviews${reviewCount ? ` (${reviewCount})` : ""}` }];
   const base = vendor.base_price || 15000;
   const pkgData = [
     { name: "Basic", price: base, features: ["Standard service", "Up to 4 hours", "1 staff"] },
     { name: "Standard", price: Math.round(base * 1.5), popular: true, features: ["Full service", "Up to 8 hours", "2 staff", "Setup & cleanup"] },
     { name: "Premium", price: Math.round(base * 2.5), features: ["All-inclusive", "Full day", "Full team", "Custom branding"] },
   ];
+
+  useEffect(() => {
+    let active = true;
+    setLoadingReviews(true);
+    fetchVendorReviews(vendor.id).then(({ reviews, count, avg }) => {
+      if (!active) return;
+      setReviews(reviews); setReviewCount(count); setReviewAvg(avg);
+      setLoadingReviews(false);
+    });
+    return () => { active = false; };
+  }, [vendor.id]);
+
   return (
     <div style={{ minHeight: "100vh", background: B.bg, paddingBottom: 90 }}>
       <div className="vendor-detail-hero" style={{ height: 260, background: `linear-gradient(135deg, ${B.dark} 0%, #1a3a6b 100%)`, position: "relative", display: "flex", alignItems: "flex-end" }}>
         <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", opacity: 0.08, color: "#fff" }}>{getCatIcon(vendor.category, 96, "#fff")}</div>
         <button onClick={onBack} style={{ position: "absolute", top: 20, left: 16, width: 36, height: 36, borderRadius: 10, background: "rgba(255,255,255,0.15)", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: "#fff", backdropFilter: "blur(8px)" }}><Icon.ChevronLeft/></button>
+        <div style={{ position: "absolute", top: 20, right: 16 }}>
+          <FavoriteButton vendorId={vendor.id} isFavorited={isFavorited} onToggle={user ? onToggleFavorite : null} onNeedAuth={onShowAuth} variant="hero"/>
+        </div>
         <div style={{ padding: "0 20px 20px", position: "relative", zIndex: 1 }}>
           <div style={{ display: "inline-flex", alignItems: "center", gap: 6, background: "rgba(212,175,106,0.2)", borderRadius: 20, padding: "4px 12px", marginBottom: 8 }}>
             <span style={{ display:"flex",alignItems:"center",color:"rgba(255,255,255,0.7)" }}>{getCatIcon(vendor.category, 13, "rgba(255,255,255,0.7)")}</span>
             <span style={{ fontSize: 12, color: B.accent, fontWeight: 600 }}>{CAT_LABELS[vendor.category] || vendor.category}</span>
           </div>
           <h1 style={{ fontFamily: "'Playfair Display',serif", fontSize: 28, fontWeight: 700, color: "#fff", lineHeight: 1.2 }}>{vendor.name}</h1>
-          <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 6 }}>
-            <Icon.MapPin/><span style={{ fontSize: 13, color: "rgba(255,255,255,0.6)" }}>{vendor.location || "Sri Lanka"}</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6 }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 6 }}><Icon.MapPin/><span style={{ fontSize: 13, color: "rgba(255,255,255,0.6)" }}>{vendor.location || "Sri Lanka"}</span></span>
+            {!loadingReviews && <RatingBadge avg={reviewAvg} count={reviewCount}/>}
           </div>
         </div>
       </div>
       <div style={{ background: B.surface, borderBottom: `1px solid ${B.border}`, display: "flex", paddingLeft: 16, position: "sticky", top: 0, zIndex: 100 }}>
         {tabs.map(tab => (
-          <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{ padding: "12px 16px", background: "none", border: "none", borderBottom: `2px solid ${activeTab === tab.id ? B.accent : "transparent"}`, color: activeTab === tab.id ? B.text : B.textMuted, fontWeight: activeTab === tab.id ? 700 : 500, fontSize: 13, cursor: "pointer" }}>{tab.label}</button>
+          <button key={tab.id} onClick={() => setActiveTab(tab.id)} style={{ padding: "12px 16px", background: "none", border: "none", borderBottom: `2px solid ${activeTab === tab.id ? B.accent : "transparent"}`, color: activeTab === tab.id ? B.text : B.textMuted, fontWeight: activeTab === tab.id ? 700 : 500, fontSize: 13, cursor: "pointer", whiteSpace: "nowrap" }}>{tab.label}</button>
         ))}
       </div>
       <div className="evara-page-inner" style={{ padding: "20px 16px", display: "flex", flexDirection: "column", gap: 16 }}>
         {activeTab === "overview" && (
           <>
             <div style={{ display: "flex", gap: 12 }}>
-              {[{ label: "Rating", value: `${vendor.rating || "4.8"} ★` }, { label: "Events", value: vendor.events_count || "50+" }, { label: "Response", value: vendor.response_time || "< 1hr" }].map(({ label, value }) => (
+              {[
+                { label: "Rating", value: reviewCount ? `${reviewAvg.toFixed(1)} ★` : "New" },
+                { label: "Reviews", value: reviewCount || 0 },
+                { label: "Response", value: vendor.response_time || "< 1hr" },
+              ].map(({ label, value }) => (
                 <div key={label} style={{ flex: 1, background: B.surface, borderRadius: 12, border: `1px solid ${B.border}`, padding: "12px 10px", textAlign: "center" }}>
                   <div style={{ fontWeight: 700, fontSize: 16, color: B.text }}>{value}</div>
                   <div style={{ fontSize: 11, color: B.textMuted, marginTop: 2 }}>{label}</div>
@@ -685,6 +1198,40 @@ function VendorDetail({ vendor, user, token, onBack, onBookingSuccess, showToast
             </div>
           </div>
         )}
+        {activeTab === "reviews" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {loadingReviews ? (
+              [1, 2, 3].map(i => <div key={i} style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16, height: 84 }}><Skeleton h="100%" r={14}/></div>)
+            ) : reviews.length === 0 ? (
+              <div style={{ textAlign: "center", padding: "40px 20px" }}>
+                <div style={{ width: 52, height: 52, borderRadius: 14, background: B.surface, border: `1px solid ${B.border}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 14px", color: B.textMuted }}>
+                  <Icon.Star/>
+                </div>
+                <div style={{ fontWeight: 700, fontSize: 15, color: B.text, marginBottom: 4 }}>No reviews yet</div>
+                <div style={{ fontSize: 13, color: B.textMuted }}>Be the first to book and share your experience.</div>
+              </div>
+            ) : (
+              <>
+                <div style={{ display: "flex", alignItems: "center", gap: 14, background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16 }}>
+                  <div style={{ fontFamily: "'Playfair Display',serif", fontSize: 32, fontWeight: 700, color: B.text }}>{reviewAvg.toFixed(1)}</div>
+                  <div>
+                    <StarRow rating={reviewAvg} size={15}/>
+                    <div style={{ fontSize: 12, color: B.textMuted, marginTop: 3 }}>Based on {reviewCount} review{reviewCount !== 1 ? "s" : ""}</div>
+                  </div>
+                </div>
+                {reviews.map(r => (
+                  <div key={r.id} style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+                      <StarRow rating={r.rating}/>
+                      <span style={{ fontSize: 11, color: B.textMuted }}>{formatDate(r.created_at)}</span>
+                    </div>
+                    {r.comment && <p style={{ fontSize: 13.5, color: B.text, lineHeight: 1.6 }}>{r.comment}</p>}
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+        )}
         {user ? (
           <button onClick={() => setShowBooking(true)} style={{ width: "100%", padding: 16, borderRadius: 14, background: B.dark, color: "#fff", fontWeight: 700, fontSize: 16, border: "none", cursor: "pointer" }}>
             Book Now — from {fmt(vendor.base_price || 15000)}
@@ -702,17 +1249,18 @@ function VendorDetail({ vendor, user, token, onBack, onBookingSuccess, showToast
 }
 
 // ─── Explore Page ─────────────────────────────────────────────────────────────
-function VendorCard({ vendor, onSelect }) {
+function VendorCard({ vendor, onSelect, rating, isFavorited, onToggleFavorite, onNeedAuth }) {
   return (
-    <div onClick={() => onSelect(vendor)} className="vendor-card" style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16, display: "flex", gap: 14, cursor: "pointer", transition: "box-shadow .18s, transform .18s" }} onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = "0 8px 28px rgba(28,43,75,0.10)"; e.currentTarget.style.borderColor = `${B.primary}33`; }} onMouseLeave={e => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = ""; e.currentTarget.style.borderColor = B.border; }}>
+    <div onClick={() => onSelect(vendor)} className="vendor-card" style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16, display: "flex", gap: 14, cursor: "pointer", transition: "box-shadow .18s, transform .18s", position: "relative" }} onMouseEnter={e => { e.currentTarget.style.transform = "translateY(-2px)"; e.currentTarget.style.boxShadow = "0 8px 28px rgba(28,43,75,0.10)"; e.currentTarget.style.borderColor = `${B.primary}33`; }} onMouseLeave={e => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = ""; e.currentTarget.style.borderColor = B.border; }}>
       <div className="vendor-card-img" style={{ width: 80, height: 80, borderRadius: 12, background: `linear-gradient(135deg,${B.primary}10,${B.primary}22)`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, border: `1px solid ${B.border}`, overflow: "hidden", color: B.primary }}>
         {vendor.image_url ? <img src={vendor.image_url} alt={vendor.name} style={{ width: "100%", height: "100%", objectFit: "cover" }}/> : getCatIcon(vendor.category, 30, B.primary)}
       </div>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 3 }}>
-          <div style={{ fontWeight: 700, fontSize: 15, color: B.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "68%" }}>{vendor.name}</div>
-          <div style={{ display: "flex", alignItems: "center", gap: 3, flexShrink: 0, background: "#FBF5E9", borderRadius: 8, padding: "2px 7px" }}>
-            <Icon.Star filled/><span style={{ fontSize: 12, fontWeight: 700, color: B.accent }}>{vendor.rating || "4.8"}</span>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 3, gap: 8 }}>
+          <div style={{ fontWeight: 700, fontSize: 15, color: B.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "56%" }}>{vendor.name}</div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexShrink: 0 }}>
+            <RatingBadge avg={rating?.avg} count={rating?.count || 0}/>
+            <FavoriteButton vendorId={vendor.id} isFavorited={isFavorited} onToggle={onToggleFavorite} onNeedAuth={onNeedAuth} variant="card"/>
           </div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 6 }}>
@@ -1014,31 +1562,96 @@ function PolicyModal({ initialTab = "terms", onClose }) {
   );
 }
 
-function ExplorePage({ user, token, onVendorSelect, onShowAuth }) {
+function ExplorePage({ user, token, onVendorSelect, onShowAuth, favoriteIds, onToggleFavorite, startWithSavedOnly, onConsumedSavedJump }) {
   const [vendors, setVendors] = useState([]);
+  const [ratingsMap, setRatingsMap] = useState({}); // vendor_id -> { avg, count }
+  const [platformRating, setPlatformRating] = useState(null); // { avg, count } across all vendors
   const [loading, setLoading] = useState(true);
   const [category, setCategory] = useState("all");
   const [search, setSearch] = useState("");
   const [location, setLocation] = useState("All Locations");
   const [showGrid, setShowGrid] = useState(true);
+  const [showSavedOnly, setShowSavedOnly] = useState(!!startWithSavedOnly);
+  const [sortBy, setSortBy] = useState("default"); // default | price_asc | price_desc | rating_desc
+  const [priceMin, setPriceMin] = useState("");
+  const [priceMax, setPriceMax] = useState("");
+  const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [policyTab, setPolicyTab] = useState(null); // null | "terms" | "refunds"
+
+  // Consume the one-time "jump to saved" signal from the dashboard so it
+  // doesn't keep re-triggering on every re-render of this component.
+  useEffect(() => {
+    if (startWithSavedOnly) { setShowSavedOnly(true); onConsumedSavedJump && onConsumedSavedJump(); }
+  }, [startWithSavedOnly, onConsumedSavedJump]);
 
   const fetchVendors = useCallback(async () => {
     setLoading(true);
-    let params = "?select=*&order=created_at.desc";
+    // Only approved listings are shown publicly — pending applications and
+    // rejected ones stay invisible here until an admin approves them.
+    let params = "?select=*&status=eq.approved&order=created_at.desc";
     if (category !== "all") params += `&category=eq.${category}`;
     const { data } = await sb.query("vendors", params, null);
-    setVendors(data || []);
+    const list = data || [];
+    setVendors(list);
     setLoading(false);
+
+    // One batched query for every visible vendor's reviews, instead of one
+    // request per card — keeps the Explore grid fast no matter how many
+    // vendors are shown.
+    if (list.length) {
+      const ids = list.map(v => v.id).join(",");
+      const { data: allReviews } = await sb.query("reviews", `?vendor_id=in.(${ids})&select=vendor_id,rating`, null);
+      const map = {};
+      (allReviews || []).forEach(r => {
+        if (!map[r.vendor_id]) map[r.vendor_id] = { sum: 0, count: 0 };
+        map[r.vendor_id].sum += r.rating || 0;
+        map[r.vendor_id].count += 1;
+      });
+      const avgMap = {};
+      Object.entries(map).forEach(([vid, { sum, count }]) => { avgMap[vid] = { avg: sum / count, count }; });
+      setRatingsMap(avgMap);
+    } else {
+      setRatingsMap({});
+    }
   }, [category]);
 
   useEffect(() => { fetchVendors(); }, [fetchVendors]);
 
+  // Platform-wide average across ALL vendors/reviews (independent of the
+  // category filter above) — used only for the homepage trust-bar stat, so
+  // it doesn't shift every time someone narrows the category filter.
+  useEffect(() => {
+    sb.query("reviews", "?select=rating", null).then(({ data }) => {
+      const list = data || [];
+      if (!list.length) { setPlatformRating(null); return; }
+      setPlatformRating({ avg: list.reduce((s, r) => s + (r.rating || 0), 0) / list.length, count: list.length });
+    });
+  }, []);
+
   const filtered = vendors.filter(v => {
     const mSearch = v.name?.toLowerCase().includes(search.toLowerCase()) || v.location?.toLowerCase().includes(search.toLowerCase());
     const mLoc = location === "All Locations" || v.location?.toLowerCase().includes(location.toLowerCase());
-    return mSearch && mLoc;
+    const mSaved = !showSavedOnly || favoriteIds?.has(v.id);
+    const price = v.base_price || 0;
+    const mPriceMin = !priceMin || price >= parseFloat(priceMin);
+    const mPriceMax = !priceMax || price <= parseFloat(priceMax);
+    return mSearch && mLoc && mSaved && mPriceMin && mPriceMax;
   });
+
+  const sorted = [...filtered].sort((a, b) => {
+    if (sortBy === "price_asc") return (a.base_price || 0) - (b.base_price || 0);
+    if (sortBy === "price_desc") return (b.base_price || 0) - (a.base_price || 0);
+    if (sortBy === "rating_desc") {
+      const ra = ratingsMap[a.id]?.avg || 0, rb = ratingsMap[b.id]?.avg || 0;
+      if (rb !== ra) return rb - ra;
+      // Tie-break by review count so a 5.0 from 1 review doesn't outrank a
+      // 4.9 from 50 — more-reviewed vendors are the more reliable signal.
+      return (ratingsMap[b.id]?.count || 0) - (ratingsMap[a.id]?.count || 0);
+    }
+    return 0; // "default" keeps the server's created_at.desc order
+  });
+
+  const activeFilterCount = (priceMin ? 1 : 0) + (priceMax ? 1 : 0) + (sortBy !== "default" ? 1 : 0);
 
   const vendorCounts = {};
   CATEGORIES.forEach(c => { vendorCounts[c.id] = vendors.filter(v => v.category === c.id).length; });
@@ -1053,7 +1666,17 @@ function ExplorePage({ user, token, onVendorSelect, onShowAuth }) {
             <EvaraLogo size="md" dark onClick={() => { setCategory("all"); setSearch(""); setLocation("All Locations"); setShowGrid(true); window.scrollTo({ top: 0, behavior: "smooth" }); }}/>
             {user && <div style={{ fontSize: 13, color: "rgba(255,255,255,0.5)", marginTop: 6 }}>Welcome back, {user.user_metadata?.full_name?.split(" ")[0] || "there"}</div>}
           </div>
-          {!user && <button onClick={onShowAuth} className="mobile-signin-btn" style={{ padding: "9px 20px", borderRadius: 20, background: B.accent, color: B.dark, fontWeight: 700, fontSize: 13, border: "none", cursor: "pointer" }}>Sign In</button>}
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {user && (
+              <button onClick={() => setShowSavedOnly(s => !s)} aria-label="Show saved vendors" title="Saved vendors" style={{ width: 36, height: 36, borderRadius: "50%", background: showSavedOnly ? "rgba(255,107,129,0.18)" : "rgba(255,255,255,0.08)", border: `1px solid ${showSavedOnly ? "rgba(255,107,129,0.4)" : "rgba(255,255,255,0.14)"}`, color: showSavedOnly ? "#FF6B81" : "rgba(255,255,255,0.85)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill={showSavedOnly ? "currentColor" : "none"} stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+              </button>
+            )}
+            {/* Desktop already shows notifications in the sidebar nav — this is the mobile-only equivalent, since there's no sidebar on small screens. */}
+            {user && <div className="mobile-signin-btn"><NotificationBell user={user} token={token} variant="header" onNavigateToBooking={() => window.__evaraSetTab && window.__evaraSetTab("bookings")}/></div>}
+            <ThemeToggle variant="header"/>
+            {!user && <button onClick={onShowAuth} className="mobile-signin-btn" style={{ padding: "9px 20px", borderRadius: 20, background: B.accent, color: B.dark, fontWeight: 700, fontSize: 13, border: "none", cursor: "pointer" }}>Sign In</button>}
+          </div>
         </div>
         {!user && (
           <div className="evara-page-header-inner" style={{ marginBottom: 18, position: "relative", zIndex: 1 }}>
@@ -1073,7 +1696,7 @@ function ExplorePage({ user, token, onVendorSelect, onShowAuth }) {
       {!user && (
         <div style={{ background: B.surface, borderBottom: `1px solid ${B.border}`, display: "flex", justifyContent: "center" }}>
           <div style={{ display: "flex", width: "100%" }}>
-            {[["2,400+", "Verified vendors"], ["18,000+", "Events booked"], ["25", "Districts"], ["4.9★", "Avg. rating"]].map(([n, l], i) => (
+            {[["2,400+", "Verified vendors"], ["18,000+", "Events booked"], ["25", "Districts"], [platformRating ? `${platformRating.avg.toFixed(1)}★` : "New", "Avg. rating"]].map(([n, l], i) => (
               <div key={i} style={{ flex: 1, padding: "14px 8px", textAlign: "center", borderRight: i < 3 ? `1px solid ${B.border}` : "none" }}>
                 <div style={{ fontFamily: "'Playfair Display',serif", fontSize: 18, fontWeight: 700, color: B.text }}>{n}</div>
                 <div style={{ fontSize: 10, color: B.textMuted, fontWeight: 500, marginTop: 1 }}>{l}</div>
@@ -1252,9 +1875,45 @@ function ExplorePage({ user, token, onVendorSelect, onShowAuth }) {
         </div>
       )}
 
-      {(!showGrid || category !== "all" || search) && (
+      {(!showGrid || category !== "all" || search || showSavedOnly || activeFilterCount > 0) && (
         <div className="evara-page-inner" style={{ padding: "16px 16px" }}>
-          {!loading && filtered.length > 0 && <div style={{ fontSize: 12, color: B.textMuted, marginBottom: 12, fontWeight: 500 }}>{filtered.length} vendor{filtered.length !== 1 ? "s" : ""} found</div>}
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12, gap: 10, position: "relative" }}>
+            {!loading && filtered.length > 0 ? (
+              <div style={{ fontSize: 12, color: B.textMuted, fontWeight: 500, display: "flex", alignItems: "center", gap: 6 }}>
+                {showSavedOnly && <span style={{ color: "#FF6B81", display: "flex" }}><svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg></span>}
+                {filtered.length} {showSavedOnly ? "saved vendor" : "vendor"}{filtered.length !== 1 ? "s" : ""} found
+              </div>
+            ) : <div/>}
+            <button onClick={() => setShowFilterPanel(o => !o)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 12px", borderRadius: 10, background: activeFilterCount > 0 ? B.accentSoft : B.surface, border: `1.5px solid ${activeFilterCount > 0 ? B.accent : B.border}`, color: activeFilterCount > 0 ? B.accent : B.textMuted, fontSize: 12, fontWeight: 700, cursor: "pointer", flexShrink: 0 }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="4" y1="6" x2="20" y2="6"/><circle cx="9" cy="6" r="2" fill="currentColor"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="15" cy="12" r="2" fill="currentColor"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="11" cy="18" r="2" fill="currentColor"/></svg>
+              Sort & Filter{activeFilterCount > 0 ? ` (${activeFilterCount})` : ""}
+            </button>
+            {showFilterPanel && (
+              <>
+                <div onClick={() => setShowFilterPanel(false)} style={{ position: "fixed", inset: 0, zIndex: 400 }}/>
+                <div style={{ position: "absolute", top: "calc(100% + 6px)", right: 0, width: 280, maxWidth: "calc(100vw - 32px)", background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, boxShadow: "0 16px 48px rgba(0,0,0,0.18)", padding: 16, zIndex: 401 }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: B.textMuted, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>Sort By</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 16 }}>
+                    {[["default", "Newest"], ["rating_desc", "Highest Rated"], ["price_asc", "Price: Low to High"], ["price_desc", "Price: High to Low"]].map(([id, label]) => (
+                      <button key={id} onClick={() => setSortBy(id)} style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 8px", borderRadius: 8, background: sortBy === id ? B.accentSoft : "transparent", border: "none", cursor: "pointer", textAlign: "left" }}>
+                        <span style={{ width: 14, height: 14, borderRadius: "50%", border: `1.5px solid ${sortBy === id ? B.accent : B.border}`, flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center" }}>{sortBy === id && <span style={{ width: 7, height: 7, borderRadius: "50%", background: B.accent }}/>}</span>
+                        <span style={{ fontSize: 13, fontWeight: sortBy === id ? 700 : 500, color: B.text }}>{label}</span>
+                      </button>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: B.textMuted, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 8 }}>Price Range (LKR)</div>
+                  <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+                    <input type="number" value={priceMin} onChange={e => setPriceMin(e.target.value)} placeholder="Min" min="0" style={{ flex: 1, padding: "8px 10px", borderRadius: 8, border: `1.5px solid ${B.border}`, background: B.bg, color: B.text, fontSize: 13, outline: "none", boxSizing: "border-box" }}/>
+                    <input type="number" value={priceMax} onChange={e => setPriceMax(e.target.value)} placeholder="Max" min="0" style={{ flex: 1, padding: "8px 10px", borderRadius: 8, border: `1.5px solid ${B.border}`, background: B.bg, color: B.text, fontSize: 13, outline: "none", boxSizing: "border-box" }}/>
+                  </div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => { setSortBy("default"); setPriceMin(""); setPriceMax(""); }} style={{ flex: 1, padding: 10, borderRadius: 9, background: "transparent", border: `1.5px solid ${B.border}`, color: B.textMuted, fontWeight: 700, fontSize: 12.5, cursor: "pointer" }}>Reset</button>
+                    <button onClick={() => setShowFilterPanel(false)} style={{ flex: 1, padding: 10, borderRadius: 9, background: B.primary, border: "none", color: "#fff", fontWeight: 700, fontSize: 12.5, cursor: "pointer" }}>Apply</button>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
           {loading ? (
             <div className="vendor-grid" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
               {[1, 2, 3, 4].map(i => <div key={i} style={{ background: B.surface, borderRadius: 16, border: `1px solid ${B.border}`, padding: 16, display: "flex", gap: 12 }}><Skeleton w={72} h={72} r={12}/><div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 8 }}><Skeleton h={16} w="60%"/><Skeleton h={12} w="40%"/><Skeleton h={12} w="80%"/></div></div>)}
@@ -1262,15 +1921,15 @@ function ExplorePage({ user, token, onVendorSelect, onShowAuth }) {
           ) : filtered.length === 0 ? (
             <div style={{ textAlign: "center", padding: "60px 20px" }}>
               <div style={{ width: 56, height: 56, borderRadius: 14, background: B.surface, border: `1px solid ${B.border}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px", color: B.textMuted }}>
-                <Icon.Search/>
+                {showSavedOnly ? <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg> : <Icon.Search/>}
               </div>
-              <div style={{ fontWeight: 700, fontSize: 16, color: B.text, marginBottom: 6 }}>No vendors found</div>
-              <div style={{ fontSize: 13, color: B.textMuted, marginBottom: 20 }}>Try a different category or search term</div>
-              <button onClick={() => { setCategory("all"); setSearch(""); setLocation("All Locations"); setShowGrid(true); }} style={{ padding: "10px 24px", borderRadius: 10, background: B.primary, color: "#fff", fontWeight: 700, fontSize: 13, border: "none", cursor: "pointer" }}>Browse All</button>
+              <div style={{ fontWeight: 700, fontSize: 16, color: B.text, marginBottom: 6 }}>{showSavedOnly ? "No saved vendors yet" : "No vendors found"}</div>
+              <div style={{ fontSize: 13, color: B.textMuted, marginBottom: 20 }}>{showSavedOnly ? "Tap the heart on a vendor to save it here" : "Try a different category or search term"}</div>
+              <button onClick={() => { setCategory("all"); setSearch(""); setLocation("All Locations"); setShowGrid(true); setShowSavedOnly(false); setSortBy("default"); setPriceMin(""); setPriceMax(""); }} style={{ padding: "10px 24px", borderRadius: 10, background: B.primary, color: "#fff", fontWeight: 700, fontSize: 13, border: "none", cursor: "pointer" }}>Browse All</button>
             </div>
           ) : (
             <div className="vendor-grid" style={{ display: "flex", flexDirection: "column", gap: 12 }}>
-              {filtered.map(v => <VendorCard key={v.id} vendor={v} onSelect={onVendorSelect}/>)}
+              {sorted.map(v => <VendorCard key={v.id} vendor={v} onSelect={onVendorSelect} rating={ratingsMap[v.id]} isFavorited={favoriteIds?.has(v.id)} onToggleFavorite={user ? onToggleFavorite : null} onNeedAuth={onShowAuth}/>)}
             </div>
           )}
         </div>
@@ -1286,6 +1945,8 @@ function BookingsPage({ user, token, onShowAuth, showToast }) {
   const [receipt, setReceipt] = useState(null);
   const [payingId, setPayingId] = useState(null);
   const [releasingId, setReleasingId] = useState(null);
+  const [reviewedBookingIds, setReviewedBookingIds] = useState(new Set());
+  const [reviewBooking, setReviewBooking] = useState(null);
 
   const fetch = useCallback(async () => {
     if (!user) return;
@@ -1293,6 +1954,10 @@ function BookingsPage({ user, token, onShowAuth, showToast }) {
     const { data } = await sb.query("bookings", `?user_id=eq.${user.id}&select=*,vendors(name,category,location)&order=created_at.desc`, token);
     setBookings(data || []);
     setLoading(false);
+    // Find which of this user's bookings already have a review, so we don't
+    // show "Rate this vendor" twice for the same completed booking.
+    const { data: myReviews } = await sb.query("reviews", `?user_id=eq.${user.id}&select=booking_id`, token);
+    setReviewedBookingIds(new Set((myReviews || []).map(r => r.booking_id)));
   }, [user, token]);
 
   useEffect(() => { fetch(); }, [fetch]);
@@ -1393,6 +2058,17 @@ function BookingsPage({ user, token, onShowAuth, showToast }) {
                       <Icon.Unlock/>{releasingId === booking.id ? "Requesting…" : "Event Done — Request Payment Release"}
                     </button>
                   )}
+                  {booking.status === "completed" && (
+                    reviewedBookingIds.has(booking.id) ? (
+                      <div style={{ marginTop: 12, width: "100%", padding: 10, borderRadius: 10, background: B.accentSoft, color: B.textMuted, fontWeight: 600, fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center", gap: 7 }}>
+                        <Icon.Check/> You reviewed this vendor
+                      </div>
+                    ) : (
+                      <button onClick={() => setReviewBooking(booking)} style={{ marginTop: 12, width: "100%", padding: 10, borderRadius: 10, background: B.primary, color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 7, border: "none" }}>
+                        <Icon.Star filled/> Rate this vendor
+                      </button>
+                    )
+                  )}
                 </div>
               );
             })}
@@ -1400,13 +2076,23 @@ function BookingsPage({ user, token, onShowAuth, showToast }) {
         )}
       </div>
       {receipt && <Receipt booking={receipt} onClose={() => setReceipt(null)}/>}
+      {reviewBooking && (
+        <ReviewModal
+          booking={reviewBooking}
+          token={token}
+          showToast={showToast}
+          onClose={() => setReviewBooking(null)}
+          onSubmitted={() => setReviewedBookingIds(prev => new Set(prev).add(reviewBooking.id))}
+        />
+      )}
     </div>
   );
 }
 
 // ─── Profile Page ─────────────────────────────────────────────────────────────
-function ProfilePage({ user, token, onSignOut, onShowAuth }) {
+function ProfilePage({ user, token, onSignOut, onShowAuth, isVendor, isAdmin, onVendorApplicationSubmitted }) {
   const [policyTab, setPolicyTab] = useState(null); // null | "terms" | "refunds"
+  const [showVendorApp, setShowVendorApp] = useState(false);
   if (!user) {
     return (
       <div style={{ minHeight: "100vh", background: B.bg, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 24 }}>
@@ -1442,6 +2128,19 @@ function ProfilePage({ user, token, onSignOut, onShowAuth }) {
           <div style={{ fontSize: 13, fontWeight: 700, color: B.text, marginBottom: 6 }}>🛡️ Payment Protection</div>
           <div style={{ fontSize: 12, color: B.textMuted, lineHeight: 1.6 }}>All payments on Evara are held securely until your event is completed, protecting both you and the vendor.</div>
         </div>
+        {!isVendor && !isAdmin && (
+          <button onClick={() => setShowVendorApp(true)} style={{ display: "flex", alignItems: "center", gap: 12, width: "100%", textAlign: "left", background: B.surface, borderRadius: 14, padding: "14px 16px", border: `1.5px solid ${B.accent}55`, cursor: "pointer" }}>
+            <span style={{ width: 38, height: 38, borderRadius: 10, background: B.accentSoft, color: B.primary, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}><Icon.TrendUp/></span>
+            <span style={{ flex: 1 }}>
+              <span style={{ display: "block", fontSize: 14, fontWeight: 700, color: B.text }}>Become a Vendor</span>
+              <span style={{ display: "block", fontSize: 12, color: B.textMuted, marginTop: 1 }}>List your business and start getting bookings</span>
+            </span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={B.textMuted} strokeWidth="2" strokeLinecap="round"><path d="M9 18l6-6-6-6"/></svg>
+          </button>
+        )}
+        <div style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, overflow: "hidden" }}>
+          <ThemeToggle variant="row"/>
+        </div>
         <div style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, overflow: "hidden" }}>
           {[{ id: "terms", label: "Terms & Conditions" }, { id: "refunds", label: "Refund Policy" }].map((p, i) => (
             <button key={p.id} onClick={() => setPolicyTab(p.id)} style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", background: "none", border: "none", borderBottom: i === 0 ? `1px solid ${B.border}` : "none", cursor: "pointer", textAlign: "left" }}>
@@ -1455,12 +2154,195 @@ function ProfilePage({ user, token, onSignOut, onShowAuth }) {
         </button>
       </div>
       {policyTab && <PolicyModal initialTab={policyTab} onClose={() => setPolicyTab(null)}/>}
+      {showVendorApp && <VendorApplicationModal user={user} token={token} onClose={() => setShowVendorApp(false)} onSubmitted={onVendorApplicationSubmitted}/>}
+    </div>
+  );
+}
+
+// ─── Vendor Application (self-serve onboarding) ──────────────────────────────
+// Lets a signed-in customer apply to list their own business, instead of
+// requiring an admin to create the listing and link the account by hand.
+// The application lands as status='pending' — invisible on Explore — until
+// an admin approves it from the Admin → Vendors → Pending tab.
+function VendorApplicationModal({ user, token, onClose, onSubmitted }) {
+  const [form, setForm] = useState({ name: "", category: "wedding", location: "", base_price: "", description: "", response_time: "", phone: "" });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
+
+  const submit = async () => {
+    if (!form.name.trim() || !form.location.trim() || !form.base_price) { setError("Please fill in your business name, location, and starting price."); return; }
+    setLoading(true); setError("");
+    const body = {
+      user_id: user.id,
+      status: "pending",
+      name: form.name.trim(),
+      category: form.category,
+      location: form.location.trim(),
+      base_price: parseFloat(form.base_price) || 0,
+      description: form.description.trim() || null,
+      response_time: form.response_time.trim() || null,
+    };
+    const { error: err } = await sb.query("vendors", "", token, "POST", body);
+    if (err) {
+      setLoading(false);
+      setError(err.message?.includes("duplicate") ? "You already have a vendor application or listing on Evara." : (err.message || "Couldn't submit your application. Please try again."));
+      return;
+    }
+    // Flip their profile role to vendor so they get routed to the Vendor
+    // dashboard (which shows a "pending review" state) instead of staying
+    // on the customer Explore/Bookings view after this.
+    await sb.query("profiles", `?id=eq.${user.id}`, token, "PATCH", { role: "vendor" });
+    setLoading(false);
+    onSubmitted && onSubmitted();
+    onClose();
+  };
+
+  const inputStyle = { width: "100%", padding: "11px 14px", borderRadius: 10, border: `1.5px solid ${B.border}`, background: B.bg, fontSize: 14, color: B.text, outline: "none", boxSizing: "border-box" };
+  const labelStyle = { display: "block", fontSize: 12, fontWeight: 600, color: B.textMuted, marginBottom: 6, textTransform: "uppercase", letterSpacing: 0.8 };
+
+  return (
+    <>
+      <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 600, background: "rgba(12,22,40,0.65)", backdropFilter: "blur(4px)" }}/>
+      <div style={{ position: "fixed", inset: 0, zIndex: 700, display: "flex", alignItems: "flex-end", justifyContent: "center", pointerEvents: "none" }}>
+        <div style={{ width: "100%", maxWidth: 480, maxHeight: "92vh", background: B.bg, borderRadius: "22px 22px 0 0", overflow: "hidden", display: "flex", flexDirection: "column", pointerEvents: "all", animation: "slideUp .35s cubic-bezier(.22,1,.36,1) both" }}>
+          <div style={{ padding: "16px 20px", background: B.surface, borderBottom: `1px solid ${B.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexShrink: 0 }}>
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 16, color: B.text }}>Become a Vendor</div>
+              <div style={{ fontSize: 12, color: B.textMuted, marginTop: 2 }}>List your business on Evara</div>
+            </div>
+            <button onClick={onClose} style={{ width: 34, height: 34, borderRadius: 8, border: `1.5px solid ${B.border}`, background: B.surface, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", color: B.textMuted }}><Icon.X/></button>
+          </div>
+          <div style={{ overflowY: "auto", flex: 1, padding: "20px 16px 32px", display: "flex", flexDirection: "column", gap: 14 }}>
+            <div style={{ background: B.accentSoft, borderRadius: 12, padding: "12px 14px", fontSize: 12.5, color: B.textMuted, lineHeight: 1.55, display: "flex", gap: 8 }}>
+              <span style={{ flexShrink: 0, color: B.primary }}><Icon.Shield/></span>
+              Your listing won't appear publicly until our team reviews and approves it — usually within a day or two.
+            </div>
+            <div><label style={labelStyle}>Business Name *</label><input value={form.name} onChange={e => set("name", e.target.value)} placeholder="e.g. Grand Royal Banquet Hall" style={inputStyle}/></div>
+            <div><label style={labelStyle}>Category *</label><select value={form.category} onChange={e => set("category", e.target.value)} style={{ ...inputStyle, cursor: "pointer" }}>{VENDOR_CATEGORIES.map(({ id, label, emoji }) => <option key={id} value={id}>{emoji} {label}</option>)}</select></div>
+            <div><label style={labelStyle}>Location *</label><input value={form.location} onChange={e => set("location", e.target.value)} placeholder="e.g. Colombo 03, Sri Lanka" style={inputStyle}/></div>
+            <div><label style={labelStyle}>Contact Phone</label><input value={form.phone} onChange={e => set("phone", e.target.value)} placeholder="07X XXX XXXX" style={inputStyle}/></div>
+            <div><label style={labelStyle}>Starting Price (LKR) *</label><input type="number" value={form.base_price} onChange={e => set("base_price", e.target.value)} placeholder="e.g. 50000" style={inputStyle} min="0"/></div>
+            <div><label style={labelStyle}>Typical Response Time</label><input value={form.response_time} onChange={e => set("response_time", e.target.value)} placeholder="e.g. < 1hr" style={inputStyle}/></div>
+            <div><label style={labelStyle}>Tell customers about your business</label><textarea value={form.description} onChange={e => set("description", e.target.value)} placeholder="What makes your service stand out?" style={{ ...inputStyle, minHeight: 90, resize: "vertical" }}/></div>
+            {error && <div style={{ background: "#FEF2F2", border: "1px solid #D9404033", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: B.danger, fontWeight: 600 }}>{error}</div>}
+            <button onClick={submit} disabled={loading} style={{ width: "100%", padding: 14, borderRadius: 12, background: B.primary, color: "#fff", fontWeight: 700, fontSize: 15, border: "none", cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.7 : 1, marginTop: 4 }}>
+              {loading ? "Submitting…" : "Submit Application"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
+
+// Shown to signed-in customers (not admins/vendors) when they tap the
+// "Dashboard" tab. Gives a quick at-a-glance summary of their activity on
+// Evara — upcoming events, spend, and a shortcut back into My Bookings.
+function CustomerDashboard({ user, token, onGoToBookings, onGoToExplore, favoritesCount, onGoToSaved }) {
+  const [bookings, setBookings] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchBookings = useCallback(async () => {
+    if (!user) return;
+    setLoading(true);
+    const { data } = await sb.query("bookings", `?user_id=eq.${user.id}&select=*,vendors(name,category,location)&order=created_at.desc`, token);
+    setBookings(data || []);
+    setLoading(false);
+  }, [user, token]);
+
+  useEffect(() => { fetchBookings(); }, [fetchBookings]);
+
+  const name = user?.user_metadata?.full_name?.split(" ")[0] || "there";
+  const today = new Date();
+  const upcoming = bookings.filter(b => b.event_date && new Date(b.event_date) >= today && !["cancelled"].includes(b.status));
+  const completed = bookings.filter(b => b.status === "completed" || b.status === "released");
+  const totalSpent = bookings.filter(b => ["paid", "release_requested", "released", "completed"].includes(b.status)).reduce((s, b) => s + (b.amount || 0), 0);
+  const nextEvent = [...upcoming].sort((a, b) => new Date(a.event_date) - new Date(b.event_date))[0];
+
+  const stats = [
+    { label: "Total Bookings", value: bookings.length, icon: <Icon.Bookmark/> },
+    { label: "Upcoming Events", value: upcoming.length, icon: <Icon.Calendar/> },
+    { label: "Completed", value: completed.length, icon: <Icon.Check/> },
+    { label: "Total Spent", value: fmt(totalSpent), icon: <Icon.CreditCard/> },
+  ];
+
+  return (
+    <div style={{ minHeight: "100vh", background: B.bg, paddingBottom: "clamp(16px, 10vw, 90px)" }}>
+      <div className="evara-page-header" style={{ background: B.dark, padding: "52px 0 28px" }}>
+        <div className="evara-page-header-inner">
+          <div style={{ fontFamily: "'Playfair Display',serif", fontSize: 24, fontWeight: 700, color: "#fff" }}>My Dashboard</div>
+          <div style={{ fontSize: 13, color: "rgba(255,255,255,0.45)", marginTop: 4 }}>Welcome back, {name} 👋</div>
+        </div>
+      </div>
+
+      <div className="evara-page-inner" style={{ padding: 16 }}>
+        {loading ? (
+          <div className="dash-stats-grid" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12, marginBottom: 20 }}>
+            {[1, 2, 3, 4].map(i => <div key={i} style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16, height: 78 }}><Skeleton h="100%" r={14}/></div>)}
+          </div>
+        ) : (
+          <div className="dash-stats-grid" style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12, marginBottom: 20 }}>
+            {stats.map((s, i) => (
+              <div key={i} style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16 }}>
+                <div style={{ width: 32, height: 32, borderRadius: 9, background: B.accentSoft, color: B.primary, display: "flex", alignItems: "center", justifyContent: "center", marginBottom: 10 }}>{s.icon}</div>
+                <div style={{ fontFamily: "'Playfair Display',serif", fontSize: 19, fontWeight: 700, color: B.text }}>{s.value}</div>
+                <div style={{ fontSize: 11.5, color: B.textMuted, marginTop: 2 }}>{s.label}</div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {!loading && nextEvent && (
+          <div style={{ background: B.surface, borderRadius: 16, border: `1.5px solid ${B.accent}55`, padding: 18, marginBottom: 20, position: "relative", overflow: "hidden" }}>
+            <div style={{ fontSize: 11, fontWeight: 700, color: B.accent, letterSpacing: 0.4, textTransform: "uppercase", marginBottom: 8 }}>Your Next Event</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+              <div>
+                <div style={{ fontWeight: 700, fontSize: 16, color: B.text }}>{nextEvent.vendors?.name || "Vendor"}</div>
+                <div style={{ fontSize: 12, color: B.textMuted, marginTop: 2 }}>{CAT_LABELS[nextEvent.vendors?.category] || nextEvent.vendors?.category}</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: B.textMuted, marginTop: 8 }}><Icon.Calendar/>{formatDate(nextEvent.event_date)}</div>
+              </div>
+              <span style={{ background: (STATUS_STYLE[nextEvent.status] || STATUS_STYLE.pending).bg, color: (STATUS_STYLE[nextEvent.status] || STATUS_STYLE.pending).c, fontSize: 11, fontWeight: 700, padding: "4px 10px", borderRadius: 20, whiteSpace: "nowrap" }}>{(STATUS_STYLE[nextEvent.status] || STATUS_STYLE.pending).label}</span>
+            </div>
+          </div>
+        )}
+
+        {!loading && bookings.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "50px 20px" }}>
+            <div style={{ width: 56, height: 56, borderRadius: 14, background: B.surface, border: `1px solid ${B.border}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px", color: B.textMuted }}>
+              <Icon.TrendUp/>
+            </div>
+            <div style={{ fontWeight: 700, fontSize: 16, color: B.text, marginBottom: 6 }}>Nothing to show yet</div>
+            <div style={{ fontSize: 13, color: B.textMuted, marginBottom: 20 }}>Book your first vendor and your activity will show up here</div>
+            <button onClick={onGoToExplore} style={{ padding: "10px 24px", borderRadius: 10, background: B.primary, color: "#fff", fontWeight: 700, fontSize: 13, border: "none", cursor: "pointer" }}>Browse Vendors</button>
+          </div>
+        ) : (
+          <button onClick={onGoToBookings} style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: 14, borderRadius: 12, background: B.primary, color: "#fff", fontWeight: 700, fontSize: 14, border: "none", cursor: "pointer" }}>
+            <Icon.Bookmark/> View All Bookings
+          </button>
+        )}
+
+        {!!favoritesCount && (
+          <button onClick={onGoToSaved} style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 12, width: "100%", textAlign: "left", background: B.surface, borderRadius: 14, padding: "14px 16px", border: `1px solid ${B.border}`, cursor: "pointer" }}>
+            <span style={{ width: 38, height: 38, borderRadius: 10, background: "rgba(255,107,129,0.12)", color: "#FF6B81", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" strokeWidth="2"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
+            </span>
+            <span style={{ flex: 1 }}>
+              <span style={{ display: "block", fontSize: 14, fontWeight: 700, color: B.text }}>{favoritesCount} Saved Vendor{favoritesCount !== 1 ? "s" : ""}</span>
+              <span style={{ display: "block", fontSize: 12, color: B.textMuted, marginTop: 1 }}>Vendors you've bookmarked to compare later</span>
+            </span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={B.textMuted} strokeWidth="2" strokeLinecap="round"><path d="M9 18l6-6-6-6"/></svg>
+          </button>
+        )}
+      </div>
     </div>
   );
 }
 
 // ─── Admin Panel (Fully Functional with Live DB) ──────────────────────────────
 function AdminPanel({ user, token, onSignOut, onGoHome }) {
+  const [themeMode] = useTheme();
   const [adminTab, setAdminTab] = useState("overview");
   const [vendors, setVendors] = useState([]);
   const [bookings, setBookings] = useState([]);
@@ -1480,6 +2362,8 @@ function AdminPanel({ user, token, onSignOut, onGoHome }) {
   const [confirmDel, setConfirmDel] = useState(null);
   const [searchV, setSearchV] = useState("");
   const [filterStatus, setFilterStatus] = useState("all");
+  const [vendorStatusFilter, setVendorStatusFilter] = useState("all"); // all | pending | approved | rejected
+  const [rejectingVendor, setRejectingVendor] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
 
   const showToast = (msg, type = "success") => { setToast({ msg, type }); setTimeout(() => setToast(null), 3200); };
@@ -1539,7 +2423,11 @@ function AdminPanel({ user, token, onSignOut, onGoHome }) {
 
   const updateBookingStatus = async (id, status) => {
     const { error } = await sb.query("bookings", `?id=eq.${id}`, token, "PATCH", { status });
-    if (error) { showToast("Update failed", "error"); return; }
+    if (error) {
+      const isDoubleBooked = error.message?.includes("duplicate") || error.message?.includes("bookings_vendor_date_locked");
+      showToast(isDoubleBooked ? "This vendor already has a confirmed booking for that date — can't confirm two bookings for the same day." : "Update failed", "error");
+      return;
+    }
     setBookings(prev => prev.map(b => b.id === id ? { ...b, status } : b));
     showToast(`Booking updated to "${STATUS_STYLE[status]?.label || status}"`);
   };
@@ -1573,7 +2461,25 @@ function AdminPanel({ user, token, onSignOut, onGoHome }) {
     { label: "Revenue (LKR)", value: revenue.toLocaleString(), color: B.success, icon: statsIcons.revenue },
   ];
 
-  const filteredVendors = vendors.filter(v => v.name?.toLowerCase().includes(searchV.toLowerCase()) || v.location?.toLowerCase().includes(searchV.toLowerCase()) || v.category?.includes(searchV.toLowerCase()));
+  const filteredVendors = vendors
+    .filter(v => v.name?.toLowerCase().includes(searchV.toLowerCase()) || v.location?.toLowerCase().includes(searchV.toLowerCase()) || v.category?.includes(searchV.toLowerCase()))
+    .filter(v => vendorStatusFilter === "all" || (v.status || "approved") === vendorStatusFilter);
+  const pendingVendorCount = vendors.filter(v => v.status === "pending").length;
+
+  const approveVendor = async (v) => {
+    const { error } = await sb.query("vendors", `?id=eq.${v.id}`, token, "PATCH", { status: "approved", rejection_reason: null });
+    if (error) { showToast("Approval failed: " + (error.message || "unknown error"), "error"); return; }
+    setVendors(prev => prev.map(x => x.id === v.id ? { ...x, status: "approved", rejection_reason: null } : x));
+    showToast(`"${v.name}" is now live on Evara! 🎉`);
+  };
+
+  const rejectVendor = async (v, reason) => {
+    const { error } = await sb.query("vendors", `?id=eq.${v.id}`, token, "PATCH", { status: "rejected", rejection_reason: reason || null });
+    if (error) { showToast("Rejection failed: " + (error.message || "unknown error"), "error"); return; }
+    setVendors(prev => prev.map(x => x.id === v.id ? { ...x, status: "rejected", rejection_reason: reason || null } : x));
+    setRejectingVendor(null);
+    showToast(`"${v.name}" was declined.`, "info");
+  };
   const filteredBookings = filterStatus === "all" ? bookings : bookings.filter(b => b.status === filterStatus);
 
   const tabs = [
@@ -1587,7 +2493,7 @@ function AdminPanel({ user, token, onSignOut, onGoHome }) {
 
   return (
     <div style={{ minHeight: "100vh", background: B.bg, fontFamily: "'DM Sans', sans-serif" }}>
-      <style>{GLOBAL_STYLE}</style>
+      <style>{getGlobalStyle(themeMode)}</style>
       {/* Admin Top Bar */}
       <div style={{ background: B.dark, padding: "0 20px", position: "sticky", top: 0, zIndex: 200, borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", height: 56 }}>
@@ -1632,6 +2538,18 @@ function AdminPanel({ user, token, onSignOut, onGoHome }) {
       {adminTab === "overview" && (
         <div className="admin-max" style={{ padding: "16px 0" }}>
           <div className="admin-grid" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+            {pendingVendorCount > 0 && (
+              <button onClick={() => { setAdminTab("vendors"); setVendorStatusFilter("pending"); }} style={{ display: "flex", alignItems: "center", gap: 14, width: "100%", textAlign: "left", background: "#FFF4E5", borderRadius: 14, border: `1.5px solid ${B.warning}55`, padding: 16, cursor: "pointer" }}>
+                <span style={{ width: 38, height: 38, borderRadius: 10, background: "#fff", color: B.warning, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+                </span>
+                <span style={{ flex: 1 }}>
+                  <span style={{ display: "block", fontSize: 14, fontWeight: 700, color: B.text }}>{pendingVendorCount} vendor application{pendingVendorCount !== 1 ? "s" : ""} awaiting review</span>
+                  <span style={{ display: "block", fontSize: 12, color: B.textMuted, marginTop: 1 }}>New self-submitted listings need your approval before they go live</span>
+                </span>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={B.textMuted} strokeWidth="2" strokeLinecap="round"><path d="M9 18l6-6-6-6"/></svg>
+              </button>
+            )}
             {/* Recent bookings */}
             <div style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 20 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
@@ -1689,15 +2607,26 @@ function AdminPanel({ user, token, onSignOut, onGoHome }) {
             <input value={searchV} onChange={e => setSearchV(e.target.value)} placeholder="Search vendors..." style={{ flex: 1, padding: "10px 14px", borderRadius: 10, border: `1.5px solid ${B.border}`, background: B.surface, fontSize: 14, color: B.text, outline: "none" }}/>
             <button onClick={() => { setEditVendor(null); setShowAddForm(true); }} style={{ display: "flex", alignItems: "center", gap: 6, padding: "10px 16px", borderRadius: 10, background: B.primary, color: "#fff", fontWeight: 700, fontSize: 13, border: "none", cursor: "pointer", whiteSpace: "nowrap" }}>+ Add Vendor</button>
           </div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 14, flexWrap: "wrap" }}>
+            {[["all", "All"], ["pending", `Pending${pendingVendorCount ? ` (${pendingVendorCount})` : ""}`], ["approved", "Approved"], ["rejected", "Rejected"]].map(([s, label]) => (
+              <button key={s} onClick={() => setVendorStatusFilter(s)} style={{ padding: "6px 14px", borderRadius: 20, fontSize: 12, fontWeight: 600, cursor: "pointer", background: vendorStatusFilter === s ? B.primary : B.surface, color: vendorStatusFilter === s ? "#fff" : (s === "pending" && pendingVendorCount > 0 ? B.warning : B.textMuted), border: `1.5px solid ${vendorStatusFilter === s ? B.primary : (s === "pending" && pendingVendorCount > 0 ? `${B.warning}66` : B.border)}` }}>
+                {label}
+              </button>
+            ))}
+          </div>
           {loadingV ? [1, 2, 3].map(i => <div key={i} style={{ background: B.surface, borderRadius: 14, height: 80, border: `1px solid ${B.border}`, marginBottom: 10 }}><Skeleton h="100%" r={14}/></div>) :
             filteredVendors.length === 0 ? <div style={{ textAlign: "center", padding: "60px 0", color: B.textMuted }}><div style={{ width:52,height:52,borderRadius:12,background:B.surface,border:`1px solid ${B.border}`,display:"flex",alignItems:"center",justifyContent:"center",margin:"0 auto 12px",color:B.textMuted }}><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg></div><div style={{ fontWeight: 700 }}>No vendors found</div></div> :
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              {filteredVendors.map(v => (
-                <div key={v.id} style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: "14px 16px", display: "flex", alignItems: "center", gap: 14 }}>
+              {filteredVendors.map(v => {
+                const vStatus = v.status || "approved";
+                return (
+                <div key={v.id} style={{ background: B.surface, borderRadius: 14, border: `1.5px solid ${vStatus === "pending" ? `${B.warning}66` : B.border}`, padding: "14px 16px", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
                   <div style={{ width: 48, height: 48, borderRadius: 12, background: B.bg, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, border: `1px solid ${B.border}`, color: B.primary }}>{getCatIcon(v.category, 22, B.primary)}</div>
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ flex: 1, minWidth: 180 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                       <div style={{ fontWeight: 700, fontSize: 14, color: B.text, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v.name}</div>
+                      {vStatus === "pending" && <span style={{ background: "#FFF4E5", color: B.warning, fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 6, flexShrink: 0 }}>⏳ Pending Review</span>}
+                      {vStatus === "rejected" && <span style={{ background: "#FEF2F2", color: B.danger, fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 6, flexShrink: 0 }}>✕ Rejected</span>}
                       {v.user_id ? (
                         <span style={{ background: "#EDFAF4", color: B.success, fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 6, flexShrink: 0 }}>👤 Claimed</span>
                       ) : (
@@ -1705,19 +2634,29 @@ function AdminPanel({ user, token, onSignOut, onGoHome }) {
                       )}
                     </div>
                     <div style={{ fontSize: 12, color: B.textMuted, marginTop: 2 }}>{CAT_LABELS[v.category] || v.category} · {v.location || "—"} · {fmt(v.base_price || 0)}</div>
-                    <div style={{ fontSize: 11, color: B.textLight, marginTop: 2 }}>Added {formatDate(v.created_at)}</div>
+                    <div style={{ fontSize: 11, color: B.textLight, marginTop: 2 }}>{vStatus === "pending" ? "Applied" : "Added"} {formatDate(v.created_at)}</div>
+                    {vStatus === "rejected" && v.rejection_reason && <div style={{ fontSize: 11, color: B.danger, marginTop: 4, fontStyle: "italic" }}>"{v.rejection_reason}"</div>}
                   </div>
-                  <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+                  <div style={{ display: "flex", gap: 8, flexShrink: 0, flexWrap: "wrap" }}>
+                    {vStatus === "pending" && (
+                      <>
+                        <button onClick={() => approveVendor(v)} style={{ padding: "6px 14px", borderRadius: 8, background: "#EDFAF4", border: "1px solid #1A9B6C33", color: B.success, fontWeight: 700, fontSize: 12, cursor: "pointer" }}>✓ Approve</button>
+                        <button onClick={() => setRejectingVendor(v)} style={{ padding: "6px 14px", borderRadius: 8, background: "#FEF2F2", border: "1px solid #D9404033", color: B.danger, fontWeight: 700, fontSize: 12, cursor: "pointer" }}>✕ Reject</button>
+                      </>
+                    )}
                     <button onClick={() => setAssignOwnerVendor(v)} style={{ padding: "6px 14px", borderRadius: 8, background: "#E8F5FF", border: "1px solid rgba(3,105,161,0.2)", color: "#0369A1", fontWeight: 600, fontSize: 12, cursor: "pointer" }}>{v.user_id ? "Reassign" : "Assign Owner"}</button>
                     <button onClick={() => { setEditVendor(v); setShowAddForm(true); }} style={{ padding: "6px 14px", borderRadius: 8, background: B.accentSoft, border: `1px solid ${B.border}`, color: B.text, fontWeight: 600, fontSize: 12, cursor: "pointer" }}>Edit</button>
                     <button onClick={() => setConfirmDel(v)} style={{ padding: "6px 14px", borderRadius: 8, background: "#FEF2F2", border: "1px solid #D9404033", color: B.danger, fontWeight: 600, fontSize: 12, cursor: "pointer" }}>Delete</button>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
           }
         </div>
       )}
+
+      {rejectingVendor && <RejectVendorModal vendor={rejectingVendor} onClose={() => setRejectingVendor(null)} onConfirm={(reason) => rejectVendor(rejectingVendor, reason)}/>}
 
       {/* Bookings Tab */}
       {adminTab === "bookings" && (
@@ -1977,6 +2916,30 @@ function AdminPanel({ user, token, onSignOut, onGoHome }) {
 }
 
 // ─── Assign Owner Modal ────────────────────────────────────────────────────────
+function RejectVendorModal({ vendor, onClose, onConfirm }) {
+  const [reason, setReason] = useState("");
+  return (
+    <>
+      <div onClick={onClose} style={{ position: "fixed", inset: 0, zIndex: 600, background: "rgba(12,22,40,0.65)", backdropFilter: "blur(4px)" }}/>
+      <div style={{ position: "fixed", inset: 0, zIndex: 700, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+        <div style={{ width: "100%", maxWidth: 420, background: B.bg, borderRadius: 18, overflow: "hidden", animation: "slideUp .25s ease" }}>
+          <div style={{ padding: "16px 20px", background: B.surface, borderBottom: `1px solid ${B.border}` }}>
+            <div style={{ fontWeight: 700, fontSize: 15, color: B.text }}>Decline "{vendor.name}"?</div>
+            <div style={{ fontSize: 12, color: B.textMuted, marginTop: 2 }}>They'll see this reason and can edit + resubmit.</div>
+          </div>
+          <div style={{ padding: 20, display: "flex", flexDirection: "column", gap: 12 }}>
+            <textarea value={reason} onChange={e => setReason(e.target.value)} placeholder={'Optional — e.g. "Please add more details about your packages"'} style={{ width: "100%", minHeight: 90, padding: 12, borderRadius: 10, border: `1.5px solid ${B.border}`, background: B.surface, color: B.text, fontSize: 13, fontFamily: "inherit", resize: "vertical", outline: "none", boxSizing: "border-box" }}/>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={onClose} style={{ flex: 1, padding: 12, borderRadius: 10, background: B.surface, border: `1.5px solid ${B.border}`, color: B.text, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Cancel</button>
+              <button onClick={() => onConfirm(reason.trim())} style={{ flex: 1, padding: 12, borderRadius: 10, background: B.danger, border: "none", color: "#fff", fontWeight: 700, fontSize: 13, cursor: "pointer" }}>Decline Application</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
 function AssignOwnerModal({ vendor, token, onClose, onSaved }) {
   const [email, setEmail] = useState("");
   const [searching, setSearching] = useState(false);
@@ -2074,14 +3037,14 @@ function AssignOwnerModal({ vendor, token, onClose, onSaved }) {
 // ─── Vendor Form Modal ────────────────────────────────────────────────────────
 function VendorFormModal({ vendor, token, onClose, onSaved }) {
   const isEdit = !!vendor;
-  const [form, setForm] = useState({ name: vendor?.name || "", category: vendor?.category || "wedding", location: vendor?.location || "", base_price: vendor?.base_price || "", description: vendor?.description || "", rating: vendor?.rating || "", response_time: vendor?.response_time || "" });
+  const [form, setForm] = useState({ name: vendor?.name || "", category: vendor?.category || "wedding", location: vendor?.location || "", base_price: vendor?.base_price || "", description: vendor?.description || "", response_time: vendor?.response_time || "" });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
   const handleSave = async () => {
     if (!form.name || !form.category || !form.location || !form.base_price) { setError("Please fill in all required fields."); return; }
     setLoading(true); setError("");
-    const body = { name: form.name.trim(), category: form.category, location: form.location.trim(), base_price: parseFloat(form.base_price) || 0, description: form.description.trim() || null, rating: parseFloat(form.rating) || null, response_time: form.response_time.trim() || null };
+    const body = { name: form.name.trim(), category: form.category, location: form.location.trim(), base_price: parseFloat(form.base_price) || 0, description: form.description.trim() || null, response_time: form.response_time.trim() || null, ...(isEdit ? {} : { status: "approved" }) };
     const { error: err } = isEdit ? await sb.query("vendors", `?id=eq.${vendor.id}`, token, "PATCH", body) : await sb.query("vendors", "", token, "POST", body);
     setLoading(false);
     if (err) { setError(err.message || "Save failed."); return; }
@@ -2114,7 +3077,6 @@ function VendorFormModal({ vendor, token, onClose, onSaved }) {
                 </div>
               )}
             </div>
-            <div><label style={labelStyle}>Rating (1–5)</label><input type="number" value={form.rating} onChange={e => set("rating", e.target.value)} placeholder="4.8" style={inputStyle} min="1" max="5" step="0.1"/></div>
             <div><label style={labelStyle}>Response Time</label><input value={form.response_time} onChange={e => set("response_time", e.target.value)} placeholder="e.g. < 1hr" style={inputStyle}/></div>
             <div><label style={labelStyle}>Description</label><textarea value={form.description} onChange={e => set("description", e.target.value)} placeholder="Brief description of the vendor's services..." style={{ ...inputStyle, minHeight: 90, resize: "vertical" }}/></div>
             {error && <div style={{ background: "#FEF2F2", border: "1px solid #D9404033", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: B.danger, fontWeight: 600 }}>{error}</div>}
@@ -2223,6 +3185,7 @@ function CategoryFormModal({ category, token, onClose, onSaved }) {
 
 // ─── Vendor Panel (Self-Service Dashboard) ────────────────────────────────────
 function VendorPanel({ user, token, onSignOut, onGoHome }) {
+  const [themeMode] = useTheme();
   const [vTab, setVTab] = useState("overview");
   const [myVendor, setMyVendor] = useState(null);
   const [myBookings, setMyBookings] = useState([]);
@@ -2233,6 +3196,10 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
   const [saving, setSaving] = useState(false);
   const [toast, setToast] = useState(null);
   const [filterStatus, setFilterStatus] = useState("all");
+  const [myReviews, setMyReviews] = useState([]);
+  const [reviewCount, setReviewCount] = useState(0);
+  const [reviewAvg, setReviewAvg] = useState(null);
+  const [loadingReviews, setLoadingReviews] = useState(true);
 
   const showToast = (msg, type = "success") => { setToast({ msg, type }); setTimeout(() => setToast(null), 3200); };
 
@@ -2253,8 +3220,16 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
     setLoadingB(false);
   }, [token]);
 
+  const fetchMyReviews = useCallback(async (vendorId) => {
+    if (!vendorId) { setMyReviews([]); setReviewCount(0); setReviewAvg(null); setLoadingReviews(false); return; }
+    setLoadingReviews(true);
+    const { reviews, count, avg } = await fetchVendorReviews(vendorId, token);
+    setMyReviews(reviews); setReviewCount(count); setReviewAvg(avg);
+    setLoadingReviews(false);
+  }, [token]);
+
   useEffect(() => { fetchMyVendor(); }, [fetchMyVendor]);
-  useEffect(() => { if (myVendor?.id) fetchMyBookings(myVendor.id); }, [myVendor?.id, fetchMyBookings]);
+  useEffect(() => { if (myVendor?.id) { fetchMyBookings(myVendor.id); fetchMyReviews(myVendor.id); } }, [myVendor?.id, fetchMyBookings, fetchMyReviews]);
 
   const saveListing = async () => {
     if (!form.name || !form.location || !form.base_price) { showToast("Please fill in name, location, and price.", "error"); return; }
@@ -2270,7 +3245,11 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
 
   const updateBookingStatus = async (id, status) => {
     const { error } = await sb.query("bookings", `?id=eq.${id}`, token, "PATCH", { status });
-    if (error) { showToast("Update failed", "error"); return; }
+    if (error) {
+      const isDoubleBooked = error.message?.includes("duplicate") || error.message?.includes("bookings_vendor_date_locked");
+      showToast(isDoubleBooked ? "You already have a confirmed booking on that date — decline or reschedule one before confirming both." : "Update failed", "error");
+      return;
+    }
     setMyBookings(prev => prev.map(b => b.id === id ? { ...b, status } : b));
     showToast(`Booking updated to "${STATUS_STYLE[status]?.label || status}"`);
   };
@@ -2296,6 +3275,7 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
     { id: "overview", label: "Overview" },
     { id: "listing", label: "My Listing" },
     { id: "bookings", label: "Bookings", count: myBookings.length, urgent: pendingCount > 0 },
+    { id: "reviews", label: "Reviews", count: reviewCount },
   ];
 
   const inputStyle = { width: "100%", padding: "11px 14px", borderRadius: 10, border: `1.5px solid ${B.border}`, background: B.bg, fontSize: 14, color: B.text, outline: "none", boxSizing: "border-box" };
@@ -2312,7 +3292,7 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
   if (!myVendor) {
     return (
       <div style={{ minHeight: "100vh", background: B.bg, fontFamily: "'DM Sans', sans-serif" }}>
-        <style>{GLOBAL_STYLE}</style>
+        <style>{getGlobalStyle(themeMode)}</style>
         <div style={{ background: B.dark, padding: "0 20px", height: 56, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <EvaraLogo size="sm" dark onClick={onGoHome}/>
           <button onClick={onSignOut} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 8, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, cursor: "pointer" }}><Icon.LogOut/> Sign Out</button>
@@ -2326,9 +3306,86 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
     );
   }
 
+  // Application submitted but not yet reviewed — show a waiting state
+  // instead of the full dashboard, since there are no real bookings or a
+  // public listing to manage yet.
+  if (myVendor.status === "pending") {
+    return (
+      <div style={{ minHeight: "100vh", background: B.bg, fontFamily: "'DM Sans', sans-serif" }}>
+        <style>{getGlobalStyle(themeMode)}</style>
+        <div style={{ background: B.dark, padding: "0 20px", height: 56, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <EvaraLogo size="sm" dark onClick={onGoHome}/>
+          <button onClick={onSignOut} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 8, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, cursor: "pointer" }}><Icon.LogOut/> Sign Out</button>
+        </div>
+        <div style={{ maxWidth: 480, margin: "60px auto", textAlign: "center", padding: 24 }}>
+          <div style={{ width: 60, height: 60, borderRadius: 14, background: "#FFF4E5", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px", color: B.warning }}>
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+          </div>
+          <div style={{ fontWeight: 700, fontSize: 18, color: B.text, marginBottom: 8 }}>Your application is under review</div>
+          <div style={{ fontSize: 13, color: B.textMuted, lineHeight: 1.6, marginBottom: 20 }}>Thanks for applying to list <strong style={{ color: B.text }}>{myVendor.name}</strong> on Evara. Our team typically reviews new applications within a day or two — we'll notify you once it's approved and live.</div>
+          <div style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16, textAlign: "left" }}>
+            {[["Category", CAT_LABELS[myVendor.category] || myVendor.category], ["Location", myVendor.location], ["Starting price", fmt(myVendor.base_price)]].map(([label, value]) => (
+              <div key={label} style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", fontSize: 13 }}>
+                <span style={{ color: B.textMuted }}>{label}</span>
+                <span style={{ fontWeight: 600, color: B.text }}>{value}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Application reviewed and declined — explain why (if a reason was left)
+  // and let them edit + resubmit, which the resubmit trigger in Supabase
+  // quietly moves back to 'pending' for another review.
+  if (myVendor.status === "rejected") {
+    return (
+      <div style={{ minHeight: "100vh", background: B.bg, fontFamily: "'DM Sans', sans-serif" }}>
+        <style>{getGlobalStyle(themeMode)}</style>
+        <div style={{ background: B.dark, padding: "0 20px", height: 56, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+          <EvaraLogo size="sm" dark onClick={onGoHome}/>
+          <button onClick={onSignOut} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 8, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, cursor: "pointer" }}><Icon.LogOut/> Sign Out</button>
+        </div>
+        <div style={{ maxWidth: 480, margin: "60px auto", textAlign: "center", padding: 24 }}>
+          <div style={{ width: 60, height: 60, borderRadius: 14, background: "#FEF2F2", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 16px", color: B.danger }}>
+            <Icon.X/>
+          </div>
+          <div style={{ fontWeight: 700, fontSize: 18, color: B.text, marginBottom: 8 }}>Your application wasn't approved</div>
+          <div style={{ fontSize: 13, color: B.textMuted, lineHeight: 1.6, marginBottom: myVendor.rejection_reason ? 12 : 20 }}>We weren't able to approve <strong style={{ color: B.text }}>{myVendor.name}</strong> for listing on Evara at this time.</div>
+          {myVendor.rejection_reason && (
+            <div style={{ background: "#FEF2F2", border: "1px solid #D9404033", borderRadius: 12, padding: "12px 14px", fontSize: 13, color: B.danger, textAlign: "left", marginBottom: 20 }}>{myVendor.rejection_reason}</div>
+          )}
+          <button onClick={() => { setForm({ name: myVendor.name || "", category: myVendor.category || "wedding", location: myVendor.location || "", base_price: myVendor.base_price || "", description: myVendor.description || "", response_time: myVendor.response_time || "" }); setEditing(true); setVTab("listing"); }} style={{ padding: "12px 28px", borderRadius: 10, background: B.primary, color: "#fff", fontWeight: 700, fontSize: 14, border: "none", cursor: "pointer" }}>
+            Edit & Resubmit
+          </button>
+        </div>
+        {editing && form && (
+          <div style={{ position: "fixed", inset: 0, zIndex: 600, background: "rgba(12,22,40,0.65)", backdropFilter: "blur(4px)", display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={() => setEditing(false)}>
+            <div onClick={e => e.stopPropagation()} style={{ width: "100%", maxWidth: 480, maxHeight: "85vh", background: B.bg, borderRadius: "22px 22px 0 0", overflow: "hidden", display: "flex", flexDirection: "column" }}>
+              <div style={{ padding: "16px 20px", background: B.surface, borderBottom: `1px solid ${B.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ fontWeight: 700, fontSize: 16, color: B.text }}>Edit Application</div>
+                <button onClick={() => setEditing(false)} style={{ width: 32, height: 32, borderRadius: 8, border: `1.5px solid ${B.border}`, background: B.surface, cursor: "pointer", color: B.textMuted }}><Icon.X/></button>
+              </div>
+              <div style={{ overflowY: "auto", flex: 1, padding: "18px 16px 28px", display: "flex", flexDirection: "column", gap: 12 }}>
+                <div><label style={labelStyle}>Business Name</label><input value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} style={inputStyle}/></div>
+                <div><label style={labelStyle}>Category</label><select value={form.category} onChange={e => setForm(f => ({ ...f, category: e.target.value }))} style={{ ...inputStyle, cursor: "pointer" }}>{VENDOR_CATEGORIES.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}</select></div>
+                <div><label style={labelStyle}>Location</label><input value={form.location} onChange={e => setForm(f => ({ ...f, location: e.target.value }))} style={inputStyle}/></div>
+                <div><label style={labelStyle}>Starting Price (LKR)</label><input type="number" value={form.base_price} onChange={e => setForm(f => ({ ...f, base_price: e.target.value }))} style={inputStyle}/></div>
+                <div><label style={labelStyle}>Description</label><textarea value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} style={{ ...inputStyle, minHeight: 80, resize: "vertical" }}/></div>
+                <button onClick={saveListing} disabled={saving} style={{ width: "100%", padding: 14, borderRadius: 12, background: B.primary, color: "#fff", fontWeight: 700, fontSize: 14, border: "none", cursor: saving ? "not-allowed" : "pointer", marginTop: 6 }}>{saving ? "Submitting…" : "Resubmit for Review"}</button>
+              </div>
+            </div>
+          </div>
+        )}
+        <Toast toast={toast}/>
+      </div>
+    );
+  }
+
   return (
     <div style={{ minHeight: "100vh", background: B.bg, fontFamily: "'DM Sans', sans-serif" }}>
-      <style>{GLOBAL_STYLE}</style>
+      <style>{getGlobalStyle(themeMode)}</style>
       <div style={{ background: B.dark, padding: "0 20px", position: "sticky", top: 0, zIndex: 200, borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", height: 56 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
@@ -2336,6 +3393,7 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
     <div style={{ background: "rgba(212,175,106,0.12)", border: "1px solid rgba(212,175,106,0.25)", borderRadius: 6, padding: "2px 10px", fontSize: 10.5, fontWeight: 700, color: B.accent, letterSpacing: 1.2 }}>VENDOR PORTAL</div>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <NotificationBell user={user} token={token} variant="header" onNavigateToBooking={() => setVTab("bookings")}/>
             <span style={{ fontSize: 12, color: "rgba(255,255,255,0.4)" }}>{user.email}</span>
             <button onClick={onSignOut} style={{ display: "flex", alignItems: "center", gap: 6, padding: "6px 12px", borderRadius: 8, background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", color: "rgba(255,255,255,0.7)", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
               <Icon.LogOut/> Sign Out
@@ -2438,7 +3496,7 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
                       ))}
                     </div>
                   </div>
-                  <div><div style={labelStyle}>Rating</div><div style={{ fontSize: 15, fontWeight: 700, color: B.text }}>{myVendor.rating ? `⭐ ${myVendor.rating}` : "No ratings yet"}</div></div>
+                  <div><div style={labelStyle}>Rating</div><div style={{ fontSize: 15, fontWeight: 700, color: B.text }}>{reviewCount ? `⭐ ${reviewAvg.toFixed(1)} (${reviewCount})` : "No reviews yet"}</div></div>
                   <div><div style={labelStyle}>Response Time</div><div style={{ fontSize: 15, fontWeight: 700, color: B.text }}>{myVendor.response_time || "—"}</div></div>
                   <div><div style={labelStyle}>Status</div><div style={{ fontSize: 13, fontWeight: 700, color: myVendor.verified ? B.success : B.warning }}>{myVendor.verified ? "✓ Verified" : "Pending Verification"}</div></div>
                 </div>
@@ -2490,8 +3548,17 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               {filteredBookings.map(b => {
                 const ss = STATUS_STYLE[b.status] || STATUS_STYLE.pending;
+                // If this is still pending, check whether this date is
+                // already locked by a different booking that's further
+                // along — confirming this one would hit the database's
+                // double-booking safeguard, so flag it before they try.
+                const dateAlreadyLocked = b.status === "pending" && myBookings.some(other =>
+                  other.id !== b.id &&
+                  other.event_date === b.event_date &&
+                  ["confirmed", "paid", "release_requested", "released", "completed"].includes(other.status)
+                );
                 return (
-                  <div key={b.id} style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16 }}>
+                  <div key={b.id} style={{ background: B.surface, borderRadius: 14, border: `1px solid ${dateAlreadyLocked ? `${B.warning}66` : B.border}`, padding: 16 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
                       <div>
                         <div style={{ fontWeight: 700, fontSize: 14, color: B.text }}>#{shortId(b.id)} · {b.event_type || "Event"}</div>
@@ -2503,10 +3570,16 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
                         <div style={{ background: ss.bg, color: ss.c, fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 20, marginTop: 4, display: "inline-block" }}>{ss.label}</div>
                       </div>
                     </div>
+                    {dateAlreadyLocked && (
+                      <div style={{ display: "flex", alignItems: "flex-start", gap: 7, background: "#FFF4E5", borderRadius: 8, padding: "8px 12px", fontSize: 12, color: B.warning, fontWeight: 600, marginBottom: 10 }}>
+                        <span style={{ flexShrink: 0, marginTop: 1 }}>⚠️</span>
+                        You already have a confirmed booking on this date — confirming this one too isn't possible. Decline it or contact the customer to reschedule.
+                      </div>
+                    )}
                     {b.notes && <div style={{ background: B.bg, borderRadius: 8, padding: "8px 12px", fontSize: 12, color: B.textMuted, marginBottom: 10 }}>{b.notes}</div>}
                     {b.status === "pending" && (
                       <div style={{ display: "flex", gap: 8 }}>
-                        <button onClick={() => updateBookingStatus(b.id, "confirmed")} style={{ flex: 1, padding: 10, borderRadius: 10, background: "#EDFAF4", border: "1px solid rgba(26,155,108,0.3)", color: B.success, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>✓ Confirm</button>
+                        <button onClick={() => updateBookingStatus(b.id, "confirmed")} disabled={dateAlreadyLocked} style={{ flex: 1, padding: 10, borderRadius: 10, background: dateAlreadyLocked ? B.bg : "#EDFAF4", border: `1px solid ${dateAlreadyLocked ? B.border : "rgba(26,155,108,0.3)"}`, color: dateAlreadyLocked ? B.textLight : B.success, fontWeight: 700, fontSize: 13, cursor: dateAlreadyLocked ? "not-allowed" : "pointer" }}>✓ Confirm</button>
                         <button onClick={() => updateBookingStatus(b.id, "cancelled")} style={{ flex: 1, padding: 10, borderRadius: 10, background: "#FEF2F2", border: "1px solid #D9404033", color: B.danger, fontWeight: 700, fontSize: 13, cursor: "pointer" }}>✕ Decline</button>
                       </div>
                     )}
@@ -2518,6 +3591,40 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
         </div>
       )}
 
+      {/* Reviews Tab */}
+      {vTab === "reviews" && (
+        <div className="admin-max" style={{ padding: "16px 0" }}>
+          {loadingReviews ? (
+            [1, 2, 3].map(i => <div key={i} style={{ background: B.surface, borderRadius: 14, height: 90, border: `1px solid ${B.border}`, marginBottom: 10 }}><Skeleton h="100%" r={14}/></div>)
+          ) : reviewCount === 0 ? (
+            <div style={{ textAlign: "center", padding: "60px 0", color: B.textMuted }}>
+              <div style={{ width: 52, height: 52, borderRadius: 12, background: B.surface, border: `1px solid ${B.border}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 12px", color: B.textMuted }}><Icon.Star/></div>
+              <div style={{ fontWeight: 700 }}>No reviews yet</div>
+              <div style={{ fontSize: 13, marginTop: 4 }}>Reviews appear here once customers rate a completed booking.</div>
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 14, background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16, marginBottom: 4 }}>
+                <div style={{ fontFamily: "'Playfair Display',serif", fontSize: 32, fontWeight: 700, color: B.text }}>{reviewAvg.toFixed(1)}</div>
+                <div>
+                  <StarRow rating={reviewAvg} size={15}/>
+                  <div style={{ fontSize: 12, color: B.textMuted, marginTop: 3 }}>Based on {reviewCount} review{reviewCount !== 1 ? "s" : ""}</div>
+                </div>
+              </div>
+              {myReviews.map(r => (
+                <div key={r.id} style={{ background: B.surface, borderRadius: 14, border: `1px solid ${B.border}`, padding: 16 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 6 }}>
+                    <StarRow rating={r.rating}/>
+                    <span style={{ fontSize: 11, color: B.textMuted }}>{formatDate(r.created_at)}</span>
+                  </div>
+                  {r.comment && <p style={{ fontSize: 13.5, color: B.text, lineHeight: 1.6 }}>{r.comment}</p>}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       <Toast toast={toast}/>
     </div>
   );
@@ -2525,11 +3632,12 @@ function VendorPanel({ user, token, onSignOut, onGoHome }) {
 
 // ─── Auth Screen ──────────────────────────────────────────────────────────────
 function AuthScreen({ onAuth }) {
-  const [mode, setMode] = useState("signin");
+  const [mode, setMode] = useState("signin"); // signin | signup | forgot
   const [form, setForm] = useState({ name: "", email: "", password: "" });
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [policyTab, setPolicyTab] = useState(null); // null | "terms" | "refunds"
+  const [resetSent, setResetSent] = useState(false);
   const handleSubmit = async () => {
     setError("");
     if (!form.email || !form.password) { setError("Email and password required."); return; }
@@ -2548,7 +3656,58 @@ function AuthScreen({ onAuth }) {
     setLoading(false);
     onAuth({ user, token, refreshToken: refreshTok });
   };
+  const handleForgotSubmit = async () => {
+    setError("");
+    if (!form.email) { setError("Please enter your email."); return; }
+    setLoading(true);
+    await sb.recoverPassword(form.email, window.location.origin);
+    setLoading(false);
+    // Always show the same success state regardless of whether the email
+    // exists — this is intentional: confirming "no account with that email"
+    // would let someone enumerate which emails are registered on Evara.
+    setResetSent(true);
+  };
   const signInWithGoogle = () => { window.location.href = `${SUPABASE_URL}/auth/v1/authorize?provider=google&redirect_to=${window.location.origin}`; };
+
+  if (mode === "forgot") {
+    return (
+      <div style={{ padding: "32px 28px 28px", background: B.dark, borderRadius: 20 }}>
+        <div style={{ textAlign: "center", marginBottom: 28 }}>
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}><EvaraLogo size="lg" dark/></div>
+          <div style={{ fontSize: 13, color: "rgba(255,255,255,0.4)" }}>{resetSent ? "Check your email" : "Reset your password"}</div>
+        </div>
+        {resetSent ? (
+          <div style={{ display: "flex", flexDirection: "column", gap: 16, textAlign: "center" }}>
+            <div style={{ width: 52, height: 52, borderRadius: "50%", background: "rgba(212,175,106,0.15)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto", color: B.accent }}>
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M4 4h16v16H4z" opacity="0"/><path d="M22 6l-10 7L2 6"/><rect x="2" y="4" width="20" height="16" rx="2"/></svg>
+            </div>
+            <div style={{ fontSize: 14, color: "rgba(255,255,255,0.7)", lineHeight: 1.6 }}>
+              If an Evara account exists for <strong style={{ color: "#fff" }}>{form.email}</strong>, we've sent a link to reset your password. It'll expire soon, so use it shortly.
+            </div>
+            <button onClick={() => { setMode("signin"); setResetSent(false); setError(""); }} style={{ width: "100%", padding: 14, borderRadius: 12, background: "rgba(255,255,255,0.08)", color: "#fff", fontWeight: 700, fontSize: 14, border: "1px solid rgba(255,255,255,0.12)", cursor: "pointer", marginTop: 4 }}>
+              Back to Sign In
+            </button>
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div style={{ fontSize: 13, color: "rgba(255,255,255,0.5)", marginBottom: -2, lineHeight: 1.5 }}>Enter the email on your account and we'll send you a link to reset your password.</div>
+            <div>
+              <div style={{ fontSize: 12, color: "rgba(255,255,255,0.5)", marginBottom: 6, fontWeight: 600 }}>Email</div>
+              <input type="email" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} placeholder="you@example.com" onKeyDown={e => e.key === "Enter" && handleForgotSubmit()} style={{ width: "100%", padding: "12px 14px", borderRadius: 10, border: "1.5px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.06)", color: "#fff", fontSize: 14, outline: "none" }}/>
+            </div>
+            {error && <div style={{ background: "rgba(217,64,64,0.15)", border: "1px solid rgba(217,64,64,0.3)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#FF8080" }}>{error}</div>}
+            <button onClick={handleForgotSubmit} disabled={loading} style={{ width: "100%", padding: 14, borderRadius: 12, background: B.accent, color: B.dark, fontWeight: 700, fontSize: 15, border: "none", cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.7 : 1, marginTop: 4 }}>
+              {loading ? "Sending…" : "Send Reset Link"}
+            </button>
+            <button onClick={() => { setMode("signin"); setError(""); }} style={{ background: "none", border: "none", color: "rgba(255,255,255,0.45)", fontSize: 13, fontWeight: 600, cursor: "pointer", padding: "6px 0", textAlign: "center" }}>
+              ← Back to Sign In
+            </button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div style={{ padding: "32px 28px 28px", background: B.dark, borderRadius: 20 }}>
       <div style={{ textAlign: "center", marginBottom: 28 }}>
@@ -2574,7 +3733,12 @@ function AuthScreen({ onAuth }) {
           <input type="email" value={form.email} onChange={e => setForm(f => ({ ...f, email: e.target.value }))} placeholder="you@example.com" style={{ width: "100%", padding: "12px 14px", borderRadius: 10, border: "1.5px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.06)", color: "#fff", fontSize: 14, outline: "none" }}/>
         </div>
         <div>
-          <div style={{ fontSize: 12, color: "rgba(255,255,255,0.5)", marginBottom: 6, fontWeight: 600 }}>Password</div>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 6 }}>
+            <div style={{ fontSize: 12, color: "rgba(255,255,255,0.5)", fontWeight: 600 }}>Password</div>
+            {mode === "signin" && (
+              <button onClick={() => { setMode("forgot"); setError(""); }} style={{ background: "none", border: "none", color: "rgba(255,255,255,0.45)", fontSize: 12, fontWeight: 600, cursor: "pointer", padding: 0 }}>Forgot password?</button>
+            )}
+          </div>
           <input type="password" value={form.password} onChange={e => setForm(f => ({ ...f, password: e.target.value }))} placeholder="••••••••" onKeyDown={e => e.key === "Enter" && handleSubmit()} style={{ width: "100%", padding: "12px 14px", borderRadius: 10, border: "1.5px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.06)", color: "#fff", fontSize: 14, outline: "none" }}/>
         </div>
         {error && <div style={{ background: "rgba(217,64,64,0.15)", border: "1px solid rgba(217,64,64,0.3)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#FF8080" }}>{error}</div>}
@@ -2601,8 +3765,74 @@ function AuthScreen({ onAuth }) {
 }
 
 
+// Shown when the user arrives via the "reset your password" email link.
+// recoveryToken is the short-lived access_token Supabase puts in the URL
+// fragment — it's only good for setting a new password, not for normal
+// API calls, so this screen signs the user in fresh afterwards rather than
+// reusing it as a session token.
+function ResetPasswordScreen({ recoveryToken, onDone }) {
+  const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [done, setDone] = useState(false);
+
+  const submit = async () => {
+    setError("");
+    if (password.length < 6) { setError("Password must be at least 6 characters."); return; }
+    if (password !== confirm) { setError("Passwords don't match."); return; }
+    setLoading(true);
+    const res = await sb.updatePassword(recoveryToken, password);
+    setLoading(false);
+    if (res.error || res.error_description || res.msg) {
+      setError(res.error_description || res.msg || res.error?.message || "Couldn't update your password. The link may have expired — try requesting a new one.");
+      return;
+    }
+    setDone(true);
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(12,22,40,0.7)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, animation: "fadeIn .2s ease" }}>
+      <div style={{ width: "100%", maxWidth: 440, background: B.dark, borderRadius: 20, border: "1px solid rgba(255,255,255,0.08)", boxShadow: "0 32px 80px rgba(0,0,0,0.6)", overflow: "hidden", animation: "slideUp .3s ease" }}>
+        <div style={{ padding: "32px 28px 28px" }}>
+          <div style={{ textAlign: "center", marginBottom: 28 }}>
+            <div style={{ display: "flex", justifyContent: "center", marginBottom: 8 }}><EvaraLogo size="lg" dark/></div>
+            <div style={{ fontSize: 13, color: "rgba(255,255,255,0.4)" }}>{done ? "Password updated" : "Set a new password"}</div>
+          </div>
+          {done ? (
+            <div style={{ display: "flex", flexDirection: "column", gap: 16, textAlign: "center" }}>
+              <div style={{ width: 52, height: 52, borderRadius: "50%", background: "rgba(26,155,108,0.15)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto", color: B.success }}>
+                <Icon.Check/>
+              </div>
+              <div style={{ fontSize: 14, color: "rgba(255,255,255,0.7)", lineHeight: 1.6 }}>Your password has been updated. You can now sign in with your new password.</div>
+              <button onClick={onDone} style={{ width: "100%", padding: 14, borderRadius: 12, background: B.accent, color: B.dark, fontWeight: 700, fontSize: 15, border: "none", cursor: "pointer" }}>
+                Continue to Sign In
+              </button>
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+              <div>
+                <div style={{ fontSize: 12, color: "rgba(255,255,255,0.5)", marginBottom: 6, fontWeight: 600 }}>New Password</div>
+                <input type="password" value={password} onChange={e => setPassword(e.target.value)} placeholder="At least 6 characters" style={{ width: "100%", padding: "12px 14px", borderRadius: 10, border: "1.5px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.06)", color: "#fff", fontSize: 14, outline: "none" }}/>
+              </div>
+              <div>
+                <div style={{ fontSize: 12, color: "rgba(255,255,255,0.5)", marginBottom: 6, fontWeight: 600 }}>Confirm New Password</div>
+                <input type="password" value={confirm} onChange={e => setConfirm(e.target.value)} placeholder="Re-enter your new password" onKeyDown={e => e.key === "Enter" && submit()} style={{ width: "100%", padding: "12px 14px", borderRadius: 10, border: "1.5px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.06)", color: "#fff", fontSize: 14, outline: "none" }}/>
+              </div>
+              {error && <div style={{ background: "rgba(217,64,64,0.15)", border: "1px solid rgba(217,64,64,0.3)", borderRadius: 10, padding: "10px 14px", fontSize: 13, color: "#FF8080" }}>{error}</div>}
+              <button onClick={submit} disabled={loading} style={{ width: "100%", padding: 14, borderRadius: 12, background: B.accent, color: B.dark, fontWeight: 700, fontSize: 15, border: "none", cursor: loading ? "not-allowed" : "pointer", opacity: loading ? 0.7 : 1, marginTop: 4 }}>
+                {loading ? "Updating…" : "Update Password"}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Desktop Sidebar & Mobile Nav ─────────────────────────────────────────────
-function DesktopSidebar({ tab, onTab, user, onShowAuth, onSignOut }) {
+function DesktopSidebar({ tab, onTab, user, token, onShowAuth, onSignOut, onNavigateToBooking }) {
   const tabs = [{ id: "explore", label: "Explore", icon: Icon.Home, always: true }, { id: "bookings", label: "Bookings", icon: Icon.Bookmark, always: true }, { id: "dashboard", label: "Dashboard", icon: Icon.TrendUp, always: false }, { id: "profile", label: "Profile", icon: Icon.User, always: true }].filter(t => t.always || !!user);
   const name = user?.user_metadata?.full_name || user?.email?.split("@")[0] || "";
   const initials = name.split(" ").map(n => n[0]).join("").slice(0, 2).toUpperCase() || "?";
@@ -2613,11 +3843,15 @@ function DesktopSidebar({ tab, onTab, user, onShowAuth, onSignOut }) {
         <div style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", marginTop: 8, letterSpacing: 0.5 }}>Sri Lanka's Event Platform</div>
       </div>
       <nav className="evara-sidebar-nav">
+        {user && <NotificationBell user={user} token={token} variant="sidebar" onNavigateToBooking={onNavigateToBooking}/>}
         {tabs.map(({ id, label, icon: Ico }) => (
           <button key={id} className={"evara-sidebar-item" + (tab === id ? " active" : "")} onClick={() => onTab(id)}>
             <Ico/><span>{label}</span>
           </button>
         ))}
+        <div style={{ marginTop: "auto", paddingTop: 8, borderTop: "1px solid rgba(255,255,255,0.05)" }}>
+          <ThemeToggle variant="sidebar"/>
+        </div>
       </nav>
       <div className="evara-sidebar-footer">
         {user ? (
@@ -3064,6 +4298,7 @@ function SupportWidget({ user, token }) {
 
 // ─── Root App ─────────────────────────────────────────────────────────────────
 export default function App() {
+  const [themeMode] = useTheme();
   const [user, setUser] = useState(null);
   const [token, setToken] = useState(null);
   const [refreshTok, setRefreshTok] = useState(null);
@@ -3072,6 +4307,29 @@ export default function App() {
   const [selectedVendor, setSelectedVendor] = useState(null);
   const [toast, setToast] = useState(null);
   const [profileRole, setProfileRole] = useState(null);
+  const [resetToken, setResetToken] = useState(null); // recovery access_token, while the "set new password" screen is up
+  const { favoriteIds, toggleFavorite } = useFavorites(user, token);
+  const [jumpToSaved, setJumpToSaved] = useState(false); // true for one mount of ExplorePage when arriving via "Saved Vendors" on the dashboard
+
+  // Apply the stored theme preference once on first mount, and make sure the
+  // page has a proper mobile viewport tag even if the host index.html is
+  // missing one (this app is meant to fit phones, tablets, and desktops).
+  useEffect(() => {
+    let viewport = document.querySelector('meta[name="viewport"]');
+    if (!viewport) {
+      viewport = document.createElement("meta");
+      viewport.setAttribute("name", "viewport");
+      document.head.appendChild(viewport);
+    }
+    viewport.setAttribute("content", "width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover");
+    let metaTheme = document.querySelector('meta[name="theme-color"]');
+    if (!metaTheme) {
+      metaTheme = document.createElement("meta");
+      metaTheme.setAttribute("name", "theme-color");
+      document.head.appendChild(metaTheme);
+    }
+    applyTheme(getStoredTheme());
+  }, []);
 
   const isAdmin = user?.email === ADMIN_EMAIL;
   const isVendor = !isAdmin && profileRole === "vendor";
@@ -3096,6 +4354,7 @@ export default function App() {
   }, []);
 
   useEffect(() => { window.__evaraShowAuth = () => setShowAuth(true); return () => { delete window.__evaraShowAuth; }; }, []);
+  useEffect(() => { window.__evaraSetTab = (t) => setTab(t); return () => { delete window.__evaraSetTab; }; }, []);
 
   const handleAuth = useCallback(async ({ user, token, refreshToken }) => {
     setUser(user); setToken(token); setRefreshTok(refreshToken);
@@ -3124,7 +4383,13 @@ export default function App() {
       const params = new URLSearchParams(hash.replace("#", "?"));
       const access_token = params.get("access_token");
       const refresh_token = params.get("refresh_token");
-      if (access_token) {
+      const type = params.get("type");
+      if (access_token && type === "recovery") {
+        // Recovery link clicked from the "reset your password" email — show
+        // the set-new-password screen instead of silently signing them in.
+        setResetToken(access_token);
+        window.history.replaceState(null, null, window.location.pathname);
+      } else if (access_token) {
         sb.getUser(access_token).then(user => {
           handleAuth({ user, token: access_token, refreshToken: refresh_token });
           window.history.replaceState(null, null, window.location.pathname);
@@ -3142,11 +4407,24 @@ export default function App() {
     showToast("Signed out successfully", "info");
   };
 
+  // Password recovery — takes priority over everything else, since the
+  // person just clicked a one-time link from their email and the token
+  // expires soon. Once they set a new password, drop into the normal app
+  // signed-out, so they consciously sign in with it.
+  if (resetToken) {
+    return (
+      <>
+        <style>{getGlobalStyle(themeMode)}</style>
+        <ResetPasswordScreen recoveryToken={resetToken} onDone={() => { setResetToken(null); setShowAuth(true); }}/>
+      </>
+    );
+  }
+
   // Admin dashboard
   if (user && isAdmin && tab !== "explore" && tab !== "bookings" && tab !== "profile") {
     return (
       <>
-        <style>{GLOBAL_STYLE}</style>
+        <style>{getGlobalStyle(themeMode)}</style>
         <AdminPanel user={user} token={token} onSignOut={handleSignOut} onGoHome={() => setTab("explore")}/>
       </>
     );
@@ -3156,7 +4434,7 @@ export default function App() {
   if (user && isVendor && tab !== "explore" && tab !== "bookings" && tab !== "profile") {
     return (
       <>
-        <style>{GLOBAL_STYLE}</style>
+        <style>{getGlobalStyle(themeMode)}</style>
         <VendorPanel user={user} token={token} onSignOut={handleSignOut} onGoHome={() => setTab("explore")}/>
       </>
     );
@@ -3165,8 +4443,8 @@ export default function App() {
   // Vendor detail
   if (selectedVendor) return (
     <>
-      <style>{GLOBAL_STYLE}</style>
-      <VendorDetail vendor={selectedVendor} user={user} token={token} onBack={() => setSelectedVendor(null)} onBookingSuccess={() => { showToast("Booking confirmed! 🎉"); setSelectedVendor(null); setTab("bookings"); }} showToast={showToast} onShowAuth={() => setShowAuth(true)}/>
+      <style>{getGlobalStyle(themeMode)}</style>
+      <VendorDetail vendor={selectedVendor} user={user} token={token} onBack={() => setSelectedVendor(null)} onBookingSuccess={() => { showToast("Booking confirmed! 🎉"); setSelectedVendor(null); setTab("bookings"); }} showToast={showToast} onShowAuth={() => setShowAuth(true)} isFavorited={favoriteIds.has(selectedVendor.id)} onToggleFavorite={toggleFavorite}/>
       <Toast toast={toast}/>
       {showAuth && (
         <div style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(12,22,40,0.7)", backdropFilter: "blur(6px)", display: "flex", alignItems: "center", justifyContent: "center", padding: "20px", animation: "fadeIn .2s ease" }}>
@@ -3183,13 +4461,14 @@ export default function App() {
 
   return (
     <>
-      <style>{GLOBAL_STYLE}</style>
+      <style>{getGlobalStyle(themeMode)}</style>
       <div className="evara-shell">
-        <DesktopSidebar tab={tab} onTab={setTab} user={user} onShowAuth={() => setShowAuth(true)} onSignOut={handleSignOut}/>
+        <DesktopSidebar tab={tab} onTab={setTab} user={user} token={token} onShowAuth={() => setShowAuth(true)} onSignOut={handleSignOut} onNavigateToBooking={() => setTab("bookings")}/>
         <main className="evara-main">
-          {tab === "explore" && <ExplorePage user={user} token={token} onVendorSelect={setSelectedVendor} onShowAuth={() => setShowAuth(true)}/>}
+          {tab === "explore" && <ExplorePage user={user} token={token} onVendorSelect={setSelectedVendor} onShowAuth={() => setShowAuth(true)} favoriteIds={favoriteIds} onToggleFavorite={toggleFavorite} startWithSavedOnly={jumpToSaved} onConsumedSavedJump={() => setJumpToSaved(false)}/>}
           {tab === "bookings" && <BookingsPage user={user} token={token} onShowAuth={() => setShowAuth(true)} showToast={showToast}/>}
-          {tab === "profile" && <ProfilePage user={user} token={token} onSignOut={handleSignOut} onShowAuth={() => setShowAuth(true)}/>}
+          {tab === "dashboard" && (user ? <CustomerDashboard user={user} token={token} onGoToBookings={() => setTab("bookings")} onGoToExplore={() => setTab("explore")} favoritesCount={favoriteIds.size} onGoToSaved={() => { setJumpToSaved(true); setTab("explore"); }}/> : <ExplorePage user={user} token={token} onVendorSelect={setSelectedVendor} onShowAuth={() => setShowAuth(true)} favoriteIds={favoriteIds} onToggleFavorite={toggleFavorite}/>)}
+          {tab === "profile" && <ProfilePage user={user} token={token} onSignOut={handleSignOut} onShowAuth={() => setShowAuth(true)} isVendor={isVendor} isAdmin={isAdmin} onVendorApplicationSubmitted={() => { setProfileRole("vendor"); setTab("dashboard"); showToast("Application submitted! We'll review it shortly. 🎉"); }}/>}
         </main>
       </div>
       <BottomNav tab={tab} onTab={setTab} user={user}/>
